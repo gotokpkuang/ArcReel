@@ -87,3 +87,9 @@ from lib.providers import PROVIDER_AGNES  # noqa: E402
 from lib.video_backends.agnes import AgnesVideoBackend  # noqa: E402
 
 register_backend(PROVIDER_AGNES, AgnesVideoBackend)
+
+# ComfyUI — 自托管 ComfyUI（MiniMax H3 工作流）视频生成
+from lib.providers import PROVIDER_COMFYUI  # noqa: E402
+from lib.video_backends.comfyui import ComfyUIVideoBackend  # noqa: E402
+
+register_backend(PROVIDER_COMFYUI, ComfyUIVideoBackend)

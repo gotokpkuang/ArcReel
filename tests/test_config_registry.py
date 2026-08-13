@@ -24,6 +24,7 @@ def test_all_providers_registered():
         "minimax",
         "kling",
         "agnes",
+        "comfyui",
     }
 
 
@@ -414,6 +415,7 @@ _VIDEO_AUDIO_STANCES: dict[tuple[str, str], str] = {
     ("ark-agent-plan", "doubao-seedance-2.0"): "controllable",
     ("ark-agent-plan", "doubao-seedance-2.0-fast"): "controllable",
     ("ark-agent-plan", "doubao-seedance-2.0-mini"): "controllable",
+    ("comfyui", "MiniMax-H3"): "always_on",
     ("dashscope", "happyhorse-1.0-i2v"): "always_on",
     ("dashscope", "happyhorse-1.0-r2v"): "always_on",
     ("dashscope", "happyhorse-1.0-t2v"): "always_on",

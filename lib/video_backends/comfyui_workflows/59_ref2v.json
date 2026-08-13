@@ -1,0 +1,19 @@
+{
+  "182": {"class_type": "RandomNoise", "inputs": {"noise_seed": 0}},
+  "193": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
+  "202": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "type": "minimax", "device": "default"}},
+  "203": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}},
+  "204": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},
+  "220": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["193", 0], "lora_name": "minimax_h3_fl2v_lightx2v_turbo_4step_v0.1_comfy.safetensors", "strength_model": 0.75}},
+  "200": {"class_type": "XB_Sage_BlockSwap", "inputs": {"model": ["220", 0], "sage_preset": "关闭", "blocks_to_swap": 50}},
+  "185": {"class_type": "BasicScheduler", "inputs": {"model": ["200", 0], "scheduler": "simple", "steps": 4, "denoise": 1.0}},
+  "205": {"class_type": "XB_HailuoH3VideoParams", "inputs": {"aspect_ratio": "16:9 (Widescreen)", "megapixels": 0.4, "multiple": 32, "frames_display": "", "duration": 6.0, "fps": 24, "fps_float": 24.0}},
+  "209": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": ""}},
+  "167": {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": {"clip": ["202", 0], "vae": ["203", 0], "audio_vae": ["204", 0], "prompt": ["209", 0], "width": ["205", 0], "height": ["205", 1], "length": ["205", 2], "ref_image_size": "match"}},
+  "183": {"class_type": "BasicGuider", "inputs": {"model": ["200", 0], "conditioning": ["167", 0]}},
+  "184": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}},
+  "188": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["182", 0], "guider": ["183", 0], "sampler": ["184", 0], "sigmas": ["185", 0], "latent_image": ["167", 1]}},
+  "189": {"class_type": "XB_VAEDecode", "inputs": {"samples": ["188", 0], "vae": ["203", 0], "cleanup": "卸载显存模型"}},
+  "190": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["188", 0], "vae": ["204", 0]}},
+  "210": {"class_type": "VHS_VideoCombine", "inputs": {"images": ["189", 0], "audio": ["190", 0], "frame_rate": 24.0, "loop_count": 0, "filename_prefix": "ArcReel", "format": "video/h264-mp4", "pingpong": false, "save_output": true, "trim_to_audio": false, "pix_fmt": "yuv420p", "crf": 20}}
+}

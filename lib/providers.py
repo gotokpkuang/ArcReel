@@ -14,6 +14,7 @@ PROVIDER_MINIMAX = "minimax"
 PROVIDER_KLING = "kling"
 PROVIDER_AGNES = "agnes"
 PROVIDER_ANTHROPIC = "anthropic"
+PROVIDER_COMFYUI = "comfyui"
 
 CallType = Literal["image", "video", "text", "audio"]
 CALL_TYPE_IMAGE: CallType = "image"

@@ -1450,6 +1450,35 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
         # 用户可经 video_max_workers 覆盖。其余 lane 未声明，走全局默认。
         default_concurrency={"video": 1},
     ),
+    "comfyui": ProviderMeta(
+        display_name="ComfyUI",
+        description="自托管 ComfyUI（MiniMax H3 工作流）视频生成。Base URL 填 ComfyUI 地址（如 http://192.168.3.222:8188），走已调通的 58/59 号 LoRA 加速工作流。",
+        required_keys=[],
+        optional_keys=["base_url", "video_max_workers"],
+        secret_keys=[],
+        models={
+            # ComfyUI 侧以 megapixels 表达输出档位（0.4MP 预览 / 0.9MP 出片），
+            # 与 XB_HailuoH3VideoParams.megapixels 对齐，backend 按此映射。
+            "MiniMax-H3": ModelInfo(
+                display_name="MiniMax H3 (ComfyUI)",
+                media_type="video",
+                capabilities=[],
+                audio_always_on=True,
+                default=True,
+                supported_durations=list(range(4, 16)),
+                resolutions=["0.4mp", "0.9mp"],
+                pricing=PerSecondMatrix(
+                    rates={"MiniMax-H3": {("", None): 0.0}},
+                    default_model="MiniMax-H3",
+                    dimensions="flat",
+                    currency="CNY",
+                ),
+            ),
+        },
+        # 私有部署：单 ComfyUI 实例串行执行，出厂默认串行避免并发打爆 GPU；
+        # 双实例（8188/8189）部署可经 video_max_workers 覆盖。
+        default_concurrency={"video": 1},
+    ),
 }
 
 
