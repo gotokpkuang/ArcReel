@@ -865,12 +865,33 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
     ),
     "openai": ProviderMeta(
         display_name="OpenAI",
-        description="OpenAI 官方平台，支持 GPT-5.5 / GPT-5.4 文本、GPT Image 2 图片和 Sora 视频生成。",
+        description="OpenAI 官方平台，支持 GPT-5.6 / GPT-5.5 / GPT-5.4 文本、GPT Image 2 图片和 Sora 视频生成。",
         required_keys=["api_key"],
         optional_keys=["base_url", "image_max_workers", "video_max_workers"],
         secret_keys=["api_key"],
         models={
             # --- text ---
+            # gpt-5.6 系列为 GPT-5.5 下一代，luna/sol/terra 三变体并列。
+            # 定价取 OpenAI 官方 Standard pricing 的 short-context input/output 两档；
+            # 三变体均支持 vision（GPT-5.6 family，detail 支持 low/high/original/auto）。
+            "gpt-5.6-luna": ModelInfo(
+                display_name="GPT-5.6 Luna",
+                media_type="text",
+                capabilities=["text_generation", "structured_output", "vision"],
+                pricing=_openai_text_pricing("gpt-5.6-luna", 0.20, 1.20),
+            ),
+            "gpt-5.6-sol": ModelInfo(
+                display_name="GPT-5.6 Sol",
+                media_type="text",
+                capabilities=["text_generation", "structured_output", "vision"],
+                pricing=_openai_text_pricing("gpt-5.6-sol", 5.00, 30.00),
+            ),
+            "gpt-5.6-terra": ModelInfo(
+                display_name="GPT-5.6 Terra",
+                media_type="text",
+                capabilities=["text_generation", "structured_output", "vision"],
+                pricing=_openai_text_pricing("gpt-5.6-terra", 2.00, 12.00),
+            ),
             "gpt-5.5": ModelInfo(
                 display_name="GPT-5.5",
                 media_type="text",
