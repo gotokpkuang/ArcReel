@@ -205,6 +205,23 @@ class TestGenerateAudioAsync:
         assert gen.ledger.outcomes[0]["result"].characters == len("你好世界")
         assert gen.versions.add_calls[0]["resource_type"] == "audio"
 
+    async def test_before_submit_failure_prevents_audio_backend_call(self, tmp_path: Path):
+        gen = _build_generator(tmp_path)
+
+        async def _reject() -> None:
+            raise ValueError("formal input is no longer admitted")
+
+        with pytest.raises(ValueError, match="no longer admitted"):
+            await gen.generate_audio_async(
+                text="你好世界",
+                resource_id="E1S01",
+                voice="Cherry",
+                before_submit=_reject,
+            )
+
+        assert gen._audio_backend.calls == []
+        assert gen.ledger.outcomes[-1]["status"] == "failed"
+
     async def test_backend_failure_marks_failed(self, tmp_path: Path):
         gen = _build_generator(tmp_path)
 
@@ -310,6 +327,33 @@ class TestGenerateAudioAsync:
         assert history["current_version"] == old_version
         assert [record["prompt"] for record in history["versions"]] == ["old text"]
         assert not any(path.name.startswith(".segment_E1S07") for path in formal.parent.iterdir())
+
+    async def test_paid_history_only_commit_does_not_require_a_formal_audio_file(self, tmp_path: Path):
+        gen = _build_generator(tmp_path)
+        gen.versions = VersionManager(gen.project_path)
+
+        def _commit(staged_path: Path, output_path: Path):
+            return gen.versions.commit_staged_paid_version(
+                resource_type="audio",
+                resource_id="E1S08",
+                prompt="late text",
+                staged_file=staged_path,
+                current_file=output_path,
+                select_current=False,
+            )
+
+        output_path, version = await gen.generate_audio_async(
+            text="late text",
+            resource_id="E1S08",
+            voice="Cherry",
+            commit_staged=_commit,
+        )
+
+        assert version == 1
+        assert not output_path.exists()
+        history = gen.versions.get_versions("audio", "E1S08")
+        assert history["current_version"] == 0
+        assert (gen.project_path / history["versions"][0]["file"]).read_bytes() == b"RIFFfakewav"
 
 
 # ── 用量聚合 audio_count ────────────────────────────────────────────────────────

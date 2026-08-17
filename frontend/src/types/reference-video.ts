@@ -5,6 +5,14 @@
  */
 
 import type { TransitionType } from "./script";
+import type {
+  AdmissionProblem,
+  VideoRequestCostQuote,
+  BatchAdmissionDecision,
+  BatchAdmissionTier,
+  BatchAdmissionUnit,
+  WorkflowAdmission,
+} from "./workflow";
 
 export type AssetKind = "product" | "character" | "scene" | "prop";
 
@@ -116,14 +124,7 @@ export interface ReferenceProjectionAdmission {
   problems: ReferenceProjectionProblem[];
 }
 
-/** Exact server-side quote for the projected provider video request. */
-export interface VideoRequestCostQuote {
-  amount: number;
-  currency: string;
-  provider_id: string;
-  model_id: string;
-  request_duration_seconds: number;
-}
+export type { VideoRequestCostQuote } from "./workflow";
 
 /** Current-state duration admission returned before a storyboard video is enqueued. */
 export interface NarratedVideoDurationAdmission {
@@ -162,6 +163,48 @@ export interface ReferenceDurationPrecheck {
   model_id: string | null;
   request_cost?: VideoRequestCostQuote;
   problems: ReferenceProjectionProblem[];
+}
+
+/**
+ * 批量视频生成的准入结论——「全有或全无」：三种结局都是评估成功（HTTP 200），
+ * 只有 `admitted` 创建了任务；`confirmation_required` 与 `blocked` 一个任务也没建。
+ */
+export type ReferenceBatchDecision = BatchAdmissionDecision;
+
+/**
+ * 单个目标单元的准入缺口。形状与工作流计划里的同一对象一致，故直接沿用
+ * {@link AdmissionProblem}——两处讲的是同一件事，不各留一份定义。
+ */
+export type ReferenceBatchProblem = AdmissionProblem;
+
+/**
+ * 每个目标单元的结论。受阻时本身没有问题的单元也带一条
+ * `generation_batch_admission_withheld`，其 params.blocked_unit_ids 指出是谁拦下的。
+ */
+export type ReferenceBatchUnitOutcome = BatchAdmissionUnit;
+
+/**
+ * 按申请档位分组的确认项；`cost_amount` 为 null 表示该档报价不全，不展示合计。
+ * `request_duration_seconds` 为 null 表示该组档位未解析出来，界面按「档位待定」陈述。
+ */
+export type ReferenceBatchConfirmationTier = BatchAdmissionTier;
+
+export interface ReferenceBatchAdmission extends WorkflowAdmission {
+  skipped_unit_ids: string[];
+  /** 仅 admitted 时非空 */
+  task_ids: string[];
+  /** 逐 unit 的任务行，供调用方各自兑现自己的乐观占用标记。 */
+  task_ids_by_unit: Record<string, string>;
+  deduped: boolean;
+}
+
+/** 批量端点请求体：省略 unit_ids 表示「缺失即生成」，空数组会被后端拒绝。 */
+export interface ReferenceBatchGenerateRequest {
+  unit_ids?: string[];
+  /** 必填：不声明就等于让这次批量绕过旁白交付方式的选择。 */
+  narration_delivery: "post_production" | "use_tts";
+  /** 用户已确认的申请档位，按 unit 给 */
+  confirmed_request_durations?: Record<string, number>;
 }
 
 /**

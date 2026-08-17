@@ -44,7 +44,8 @@ from lib.script_batch_edit import ScriptBatchEditCommand, ScriptBatchEditor, scr
 from lib.speech_rate import MAX_SPEECH_RATE_UPS, MIN_SPEECH_RATE_UPS, SPEECH_RATE_FIELD, is_valid_speech_rate
 from lib.status_calculator import StatusCalculator
 from lib.style_templates import is_known_template, resolve_template_prompt
-from lib.workflow_state import WorkflowStateService, WorkflowStatus
+from lib.workflow_plan import WorkflowPlan, WorkflowPlanRequest
+from lib.workflow_state import WorkflowRequestError, WorkflowStateService, WorkflowStatus
 from server.auth import CurrentUser, create_download_token, verify_download_token
 from server.routers._reorder import full_permutation_error
 from server.routers._script_edits import (
@@ -53,6 +54,7 @@ from server.routers._script_edits import (
     script_batch_status,
 )
 from server.routers._validators import validate_backend_value
+from server.services import workflow_planner as workflow_plan_service
 from server.services.project_archive import (
     ProjectArchiveService,
     ProjectArchiveValidationError,
@@ -393,13 +395,17 @@ def _validate_draft_path(draft_path: str, _t: Callable[..., str]) -> str:
 
 
 @self_auth_router.get("/projects/{name}/export/jianying-draft")
-def export_jianying_draft(
+async def export_jianying_draft(
     name: str,
     _t: Translator,
     episode: int = Query(..., description="集数编号"),
     draft_path: str = Query(..., description="用户本地剪映草稿目录"),
     download_token: str = Query(..., description="下载 token"),
     jianying_version: str = Query("6", description="剪映版本：6 或 5"),
+    narration_delivery: Literal["post_production", "use_tts"] = Query(
+        "post_production",
+        description="旁白交付版本",
+    ),
 ):
     """导出指定集的剪映草稿 ZIP"""
     import jwt as pyjwt
@@ -419,13 +425,15 @@ def export_jianying_draft(
 
     # 3. 调用服务
     from server.services.jianying_draft_service import NoCompletedSegmentsError
+    from server.services.presentation_read_model import PresentationUnavailableError
 
     svc = get_jianying_draft_service()
     try:
-        zip_path = svc.export_episode_draft(
+        zip_path = await svc.export_episode_draft(
             project_name=name,
             episode=episode,
             draft_path=draft_path,
+            variant=narration_delivery,
             use_draft_info_name=(jianying_version != "5"),
         )
     except FileNotFoundError:
@@ -435,6 +443,9 @@ def export_jianying_draft(
     except NoCompletedSegmentsError as e:
         logger.warning("剪映草稿导出参数错误: project=%s episode=%d (%s)", name, episode, e)
         raise ApiError("jianying_no_completed_segments", status_code=422, episode=episode) from e
+    except PresentationUnavailableError as exc:
+        logger.warning("剪映草稿 presentation 不可用: project=%s episode=%d (%s)", name, episode, exc)
+        raise ApiError("presentation_unavailable", status_code=422) from exc
     except Exception:
         # 含暂存/写入阶段的路径越界守卫（ValueError，str(e) 带真实路径）：属安全告警而非
         # 常规空态，不应误报为「本集无已完成片段」，一律降级为通用 500，细节只进日志
@@ -684,9 +695,19 @@ async def get_workflow_status(
         return await asyncio.to_thread(WorkflowStateService(get_project_manager()).get_status, name, episode)
     except FileNotFoundError as exc:
         raise NotFoundError("project_not_found", name=name) from exc
-    except json.JSONDecodeError:
-        raise
-    except ValueError as exc:
+    except WorkflowRequestError as exc:
+        raise BadRequestError("request_invalid") from exc
+
+
+@router.post("/projects/{name}/workflow-plan", response_model=WorkflowPlan)
+async def get_workflow_plan(name: str, request: WorkflowPlanRequest):
+    """Return the side-effect-free plan for one transient workflow request."""
+
+    try:
+        return await workflow_plan_service.get_workflow_planner(get_project_manager()).get_plan(name, request)
+    except FileNotFoundError as exc:
+        raise NotFoundError("project_not_found", name=name) from exc
+    except WorkflowRequestError as exc:
         raise BadRequestError("request_invalid") from exc
 
 
@@ -950,8 +971,10 @@ async def update_project(name: str, req: UpdateProjectRequest, _t: Translator):
                     project["episodes"] = new_episodes
 
             with project_change_source("webui"):
-                # update_project 已在持锁窗口内统一应用迁移，返回升级后字段，无需二次 load_project
-                return {"success": True, "project": manager.update_project(name, _mutate)}
+                # 单一 project 锁内完成字段更新与 episode 绑定所影响的 Manifest claim 清理；
+                # 返回升级后字段，无需二次 load_project。
+                project = manager.update_project_reconciling_episode_bindings(name, _mutate)
+                return {"success": True, "project": project}
 
         return await asyncio.to_thread(_sync)
     except FileNotFoundError as exc:

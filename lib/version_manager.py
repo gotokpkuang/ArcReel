@@ -6,23 +6,50 @@
 """
 
 import json
+import logging
 import os
 import shutil
+import sys
 import tempfile
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from lib.api_errors import BadRequestError, NotFoundError
+from lib.artifact_manifest import ArtifactManifestError, ProjectArtifactManifestAdapter
 from lib.json_io import atomic_write_bytes, atomic_write_json
 from lib.resource_paths import RESOURCE_TYPES as _RESOURCE_TYPES
-from lib.resource_paths import resource_extension
+from lib.resource_paths import resource_extension, resource_relative_path
 
 _LOCKS_GUARD = threading.Lock()
 _LOCKS_BY_VERSIONS_FILE: dict[str, threading.RLock] = {}
 _PREVIOUS_CURRENT_VERSION = "_previous_current_version"
+MANUAL_UPLOAD_VERSION_SOURCE = "manual_upload"
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class PaidVersionCommit:
+    """Outcome of recording paid media and optionally selecting it as current."""
+
+    version: int
+    selected: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StagedVersionCommit:
+    """One media selection participating in a multi-resource version commit."""
+
+    resource_type: str
+    resource_id: str
+    prompt: str
+    staged_file: Path
+    current_file: Path
+    metadata: Mapping[str, Any]
 
 
 def _get_versions_file_lock(versions_file: Path) -> threading.RLock:
@@ -33,6 +60,51 @@ def _get_versions_file_lock(versions_file: Path) -> threading.RLock:
             lock = threading.RLock()
             _LOCKS_BY_VERSIONS_FILE[key] = lock
         return lock
+
+
+def _unlink_paths(*paths: Path | None) -> list[tuple[Path, OSError]]:
+    """Attempt every unlink and return failures without masking an active operation."""
+
+    failures: list[tuple[Path, OSError]] = []
+    for path in paths:
+        if path is None:
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            failures.append((path, exc))
+    return failures
+
+
+def _report_cleanup_failures(
+    failures: list[tuple[Path, OSError]],
+    *,
+    active_failure: BaseException | None,
+) -> None:
+    for path, cleanup_failure in failures:
+        message = f"failed to remove temporary version file {path}: {cleanup_failure}"
+        if active_failure is not None:
+            active_failure.add_note(message)
+        else:
+            logger.warning("failed to remove temporary version file %s: %s", path, cleanup_failure)
+
+
+def _create_rollback_backup(current_file: Path) -> Path:
+    """Copy current media to a valid rollback file, removing an incomplete candidate on failure."""
+
+    fd, backup_name = tempfile.mkstemp(
+        prefix=f".{current_file.stem}.",
+        suffix=f"{current_file.suffix}.rollback",
+        dir=current_file.parent,
+    )
+    os.close(fd)
+    candidate = Path(backup_name)
+    try:
+        shutil.copy2(current_file, candidate)
+    except BaseException as failure:
+        _report_cleanup_failures(_unlink_paths(candidate), active_failure=failure)
+        raise
+    return candidate
 
 
 class VersionManager:
@@ -63,6 +135,22 @@ class VersionManager:
         self.versions_dir.mkdir(parents=True, exist_ok=True)
         for resource_type in self.RESOURCE_TYPES:
             (self.versions_dir / resource_type).mkdir(exist_ok=True)
+
+    @classmethod
+    def is_managed_snapshot_path(cls, resource_type: str, relative_path: object) -> bool:
+        """Whether a record points to a canonical file in its typed history bucket."""
+
+        if resource_type not in cls.RESOURCE_TYPES or not isinstance(relative_path, str) or "\\" in relative_path:
+            return False
+        path = PurePosixPath(relative_path)
+        return (
+            relative_path == path.as_posix()
+            and not path.is_absolute()
+            and len(path.parts) == 3
+            and path.parts[:2] == ("versions", resource_type)
+            and path.name not in {"", ".", ".."}
+            and path.suffix == cls.EXTENSIONS[resource_type]
+        )
 
     def _load_versions(self) -> dict:
         """加载版本元数据"""
@@ -129,6 +217,75 @@ class VersionManager:
         """
         info = self.get_versions(resource_type, resource_id)
         return info["current_version"]
+
+    @contextmanager
+    def locked_version_snapshot(self, resource_type: str, resource_id: str) -> Iterator[dict[str, Any]]:
+        """Keep one resource selection stable while a dependent read-model commit runs."""
+
+        with self._lock:
+            yield self.get_versions(resource_type, resource_id)
+
+    def selected_manual_upload_matches_current_file(
+        self,
+        resource_type: str,
+        resource_id: str,
+        artifact_path: object,
+    ) -> bool:
+        """Whether the canonical video is the exact selected manual-upload snapshot.
+
+        Manual videos deliberately carry no paid-generation basis and therefore
+        have no Artifact Manifest claim.  Batch reuse still needs stronger proof
+        than a script pointer or same-named file: the selected version record must
+        be a manual upload and its managed snapshot must byte-match the canonical
+        formal file while the version selection is locked.
+        """
+
+        if resource_type not in {"videos", "reference_videos"}:
+            return False
+        try:
+            canonical_rel = resource_relative_path(resource_type, resource_id)
+        except (TypeError, ValueError):
+            return False
+        if artifact_path != canonical_rel:
+            return False
+
+        with self._lock:
+            history = self.get_versions(resource_type, resource_id)
+            selected_version = history.get("current_version")
+            if type(selected_version) is not int or selected_version <= 0:
+                return False
+            records = history.get("versions")
+            if not isinstance(records, list):
+                return False
+            selected = next(
+                (
+                    record
+                    for record in records
+                    if isinstance(record, Mapping)
+                    and record.get("version") == selected_version
+                    and record.get("is_current") is True
+                ),
+                None,
+            )
+            if selected is None or selected.get("source") != MANUAL_UPLOAD_VERSION_SOURCE:
+                return False
+            snapshot_rel = selected.get("file")
+            if not isinstance(snapshot_rel, str) or not self.is_managed_snapshot_path(resource_type, snapshot_rel):
+                return False
+            try:
+                adapter = ProjectArtifactManifestAdapter(self.project_path)
+                canonical = adapter.inspect_artifact_content(canonical_rel)
+                snapshot = adapter.inspect_artifact_content(snapshot_rel)
+            except ArtifactManifestError:
+                return False
+            if (
+                canonical.blocker is not None
+                or snapshot.blocker is not None
+                or not canonical.present
+                or not snapshot.present
+            ):
+                return False
+            return canonical.content_digest == snapshot.content_digest
 
     def add_version(
         self, resource_type: str, resource_id: str, prompt: str, source_file: Path | None = None, **metadata
@@ -235,6 +392,8 @@ class VersionManager:
             records = resource_data.setdefault("versions", [])
             created_snapshots: list[Path] = []
             current_backup: Path | None = None
+            current_existed = current_file.is_file()
+            activation_succeeded = False
 
             def _append_version(source: Path, version_prompt: str, version_metadata: dict) -> int:
                 previous_current_version = resource_data.get("current_version", 0)
@@ -264,15 +423,8 @@ class VersionManager:
 
             try:
                 current_file.parent.mkdir(parents=True, exist_ok=True)
-                if current_file.is_file():
-                    fd, backup_name = tempfile.mkstemp(
-                        prefix=f".{current_file.stem}.",
-                        suffix=f"{current_file.suffix}.rollback",
-                        dir=current_file.parent,
-                    )
-                    os.close(fd)
-                    current_backup = Path(backup_name)
-                    shutil.copy2(current_file, current_backup)
+                if current_existed:
+                    current_backup = _create_rollback_backup(current_file)
                     if not resource_data.get("current_version"):
                         _append_version(current_file, "", {})
 
@@ -281,15 +433,16 @@ class VersionManager:
                 self._save_versions(data)
                 if on_commit is not None:
                     on_commit()
+                activation_succeeded = True
                 return new_version
-            except BaseException:
+            except BaseException as failure:
                 rollback_errors: list[OSError] = []
                 try:
                     if current_backup is None:
-                        current_file.unlink(missing_ok=True)
+                        if not current_existed:
+                            current_file.unlink(missing_ok=True)
                     else:
                         os.replace(current_backup, current_file)
-                        current_backup = None
                 except OSError as exc:
                     rollback_errors.append(exc)
                 try:
@@ -305,13 +458,327 @@ class VersionManager:
                     except OSError as exc:
                         rollback_errors.append(exc)
                 if rollback_errors:
+                    rollback_errors[0].__cause__ = failure
                     raise RuntimeError(
                         "version activation failed and durable rollback was incomplete"
                     ) from rollback_errors[0]
                 raise
             finally:
-                if current_backup is not None:
-                    current_backup.unlink(missing_ok=True)
+                if activation_succeeded:
+                    _report_cleanup_failures(_unlink_paths(current_backup), active_failure=sys.exception())
+
+    def commit_staged_versions(
+        self,
+        commits: Sequence[StagedVersionCommit],
+        *,
+        on_commit: Callable[[], None] | None = None,
+    ) -> dict[tuple[str, str], int]:
+        """Atomically select a batch of staged media files and version pointers.
+
+        The complete ``versions.json`` plus every canonical file is restored if
+        any activation or the final sidecar hook fails. Resource identities and
+        canonical paths must be unique so rollback has one unambiguous owner.
+        """
+
+        batch = tuple(commits)
+        if not batch:
+            return {}
+        identities: set[tuple[str, str]] = set()
+        current_paths: set[Path] = set()
+        for commit in batch:
+            if commit.resource_type not in self.RESOURCE_TYPES:
+                raise ValueError(f"不支持的资源类型: {commit.resource_type}")
+            identity = (commit.resource_type, commit.resource_id)
+            if identity in identities:
+                raise ValueError(f"duplicate staged version identity: {identity!r}")
+            identities.add(identity)
+            staged_file = Path(commit.staged_file)
+            current_file = Path(commit.current_file)
+            if not staged_file.is_file():
+                raise FileNotFoundError(f"staged version file does not exist: {staged_file}")
+            normalized_current = current_file.resolve(strict=False)
+            if normalized_current in current_paths:
+                raise ValueError(f"duplicate staged version target: {current_file}")
+            current_paths.add(normalized_current)
+
+        with self._lock:
+            versions_existed = self.versions_file.is_file()
+            versions_snapshot = self.versions_file.read_bytes() if versions_existed else None
+            data = self._load_versions()
+            created_snapshots: list[Path] = []
+            current_states: list[tuple[Path, bool, Path | None]] = []
+            result: dict[tuple[str, str], int] = {}
+            activation_succeeded = False
+
+            def _append_version(
+                *,
+                commit: StagedVersionCommit,
+                resource_data: dict[str, Any],
+                source: Path,
+                prompt: str,
+                metadata: Mapping[str, Any],
+            ) -> int:
+                records = resource_data.setdefault("versions", [])
+                previous = resource_data.get("current_version", 0)
+                if not isinstance(previous, int) or isinstance(previous, bool) or previous < 0:
+                    previous = 0
+                version = max((item.get("version", 0) for item in records), default=0) + 1
+                timestamp = self._generate_timestamp()
+                ext = self.EXTENSIONS.get(commit.resource_type, ".png")
+                filename = f"{commit.resource_id}_v{version}_{timestamp}{ext}"
+                rel_path = f"versions/{commit.resource_type}/{filename}"
+                abs_path = self.project_path / rel_path
+                self._ensure_dirs()
+                shutil.copy2(source, abs_path)
+                created_snapshots.append(abs_path)
+                records.append(
+                    {
+                        "version": version,
+                        "file": rel_path,
+                        "prompt": prompt,
+                        "created_at": self._generate_iso_timestamp(),
+                        **dict(metadata),
+                        _PREVIOUS_CURRENT_VERSION: previous,
+                    }
+                )
+                resource_data["current_version"] = version
+                return version
+
+            try:
+                for commit in batch:
+                    staged_file = Path(commit.staged_file)
+                    current_file = Path(commit.current_file)
+                    current_file.parent.mkdir(parents=True, exist_ok=True)
+                    bucket = data.setdefault(commit.resource_type, {})
+                    resource_data = bucket.setdefault(
+                        commit.resource_id,
+                        {"current_version": 0, "versions": []},
+                    )
+                    current_existed = current_file.is_file()
+                    backup = _create_rollback_backup(current_file) if current_existed else None
+                    current_states.append((current_file, current_existed, backup))
+                    if current_existed and not resource_data.get("current_version"):
+                        _append_version(
+                            commit=commit,
+                            resource_data=resource_data,
+                            source=current_file,
+                            prompt="",
+                            metadata={},
+                        )
+                    version = _append_version(
+                        commit=commit,
+                        resource_data=resource_data,
+                        source=staged_file,
+                        prompt=commit.prompt,
+                        metadata=commit.metadata,
+                    )
+                    os.replace(staged_file, current_file)
+                    result[(commit.resource_type, commit.resource_id)] = version
+
+                self._save_versions(data)
+                if on_commit is not None:
+                    on_commit()
+                activation_succeeded = True
+                return result
+            except BaseException as failure:
+                rollback_errors: list[OSError] = []
+                for current_file, current_existed, backup in reversed(current_states):
+                    try:
+                        if backup is None:
+                            if not current_existed:
+                                current_file.unlink(missing_ok=True)
+                        else:
+                            os.replace(backup, current_file)
+                    except OSError as exc:
+                        rollback_errors.append(exc)
+                try:
+                    if versions_snapshot is None:
+                        self.versions_file.unlink(missing_ok=True)
+                    else:
+                        atomic_write_bytes(self.versions_file, versions_snapshot)
+                except OSError as exc:
+                    rollback_errors.append(exc)
+                for path in created_snapshots:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError as exc:
+                        rollback_errors.append(exc)
+                if rollback_errors:
+                    rollback_errors[0].__cause__ = failure
+                    raise RuntimeError(
+                        "batch version activation failed and durable rollback was incomplete"
+                    ) from rollback_errors[0]
+                raise
+            finally:
+                if activation_succeeded:
+                    _report_cleanup_failures(
+                        _unlink_paths(*(backup for _path, _existed, backup in current_states)),
+                        active_failure=sys.exception(),
+                    )
+
+    def commit_staged_paid_version(
+        self,
+        resource_type: str,
+        resource_id: str,
+        prompt: str,
+        *,
+        staged_file: Path,
+        current_file: Path,
+        select_current: bool | Callable[[], bool],
+        expected_current_version: int | None = None,
+        on_select: Callable[[], None] | None = None,
+        **metadata,
+    ) -> PaidVersionCommit:
+        """Record paid output and decide current selection inside one version lock.
+
+        A non-selected result is copied into history without changing the formal
+        file or current pointer. A callable selection guard runs after the paid
+        snapshot is durable and while the version lock remains held. When
+        selection is requested, the formal file, pointer, and ``on_select``
+        registration form one guarded transition. A selection failure restores
+        the old formal selection while retaining the paid result as a
+        non-current historical version.
+        """
+
+        if resource_type not in self.RESOURCE_TYPES:
+            raise ValueError(f"不支持的资源类型: {resource_type}")
+        if not isinstance(select_current, bool) and not callable(select_current):
+            raise TypeError("select_current must be a boolean or a callable returning one")
+        if expected_current_version is not None and (
+            type(expected_current_version) is not int or expected_current_version < 0
+        ):
+            raise ValueError("expected_current_version must be a non-negative integer or null")
+        staged_file = Path(staged_file)
+        current_file = Path(current_file)
+        if not staged_file.is_file():
+            raise FileNotFoundError(f"staged version file does not exist: {staged_file}")
+
+        with self._lock:
+            versions_existed = self.versions_file.is_file()
+            versions_snapshot = self.versions_file.read_bytes() if versions_existed else None
+            data = self._load_versions()
+            bucket = data.setdefault(resource_type, {})
+            resource_data = bucket.setdefault(resource_id, {"current_version": 0, "versions": []})
+            records = resource_data.setdefault("versions", [])
+            created_snapshots: list[Path] = []
+
+            def _append_snapshot(source: Path, version_prompt: str, version_metadata: dict) -> int:
+                previous = resource_data.get("current_version", 0)
+                if not isinstance(previous, int) or isinstance(previous, bool) or previous < 0:
+                    previous = 0
+                version = max((item.get("version", 0) for item in records), default=0) + 1
+                timestamp = self._generate_timestamp()
+                ext = self.EXTENSIONS.get(resource_type, ".png")
+                rel_path = f"versions/{resource_type}/{resource_id}_v{version}_{timestamp}{ext}"
+                abs_path = self.project_path / rel_path
+                self._ensure_dirs()
+                shutil.copy2(source, abs_path)
+                created_snapshots.append(abs_path)
+                records.append(
+                    {
+                        "version": version,
+                        "file": rel_path,
+                        "prompt": version_prompt,
+                        "created_at": self._generate_iso_timestamp(),
+                        **version_metadata,
+                        _PREVIOUS_CURRENT_VERSION: previous,
+                    }
+                )
+                return version
+
+            try:
+                submitted_current = resource_data.get("current_version", 0)
+                if (
+                    not isinstance(submitted_current, int)
+                    or isinstance(submitted_current, bool)
+                    or submitted_current < 0
+                ):
+                    submitted_current = 0
+                if current_file.is_file() and not resource_data.get("current_version"):
+                    tracked = _append_snapshot(current_file, "", {})
+                    resource_data["current_version"] = tracked
+                prior_current = resource_data.get("current_version", 0)
+                if not isinstance(prior_current, int) or isinstance(prior_current, bool) or prior_current < 0:
+                    prior_current = 0
+                    resource_data["current_version"] = 0
+                version = _append_snapshot(staged_file, prompt, metadata)
+                # Persist paid history before any selection callback can fail.
+                self._save_versions(data)
+            except BaseException as failure:
+                history_rollback_errors: list[OSError] = []
+                try:
+                    if versions_snapshot is None:
+                        self.versions_file.unlink(missing_ok=True)
+                    else:
+                        atomic_write_bytes(self.versions_file, versions_snapshot)
+                except OSError as exc:
+                    history_rollback_errors.append(exc)
+                history_rollback_errors.extend(
+                    cleanup_failure for _path, cleanup_failure in _unlink_paths(*created_snapshots, staged_file)
+                )
+                if history_rollback_errors:
+                    history_rollback_errors[0].__cause__ = failure
+                    raise RuntimeError(
+                        "paid version history commit failed and rollback was incomplete"
+                    ) from history_rollback_errors[0]
+                raise
+
+            try:
+                should_select = (
+                    False
+                    if expected_current_version is not None and submitted_current != expected_current_version
+                    else select_current()
+                    if callable(select_current)
+                    else select_current
+                )
+                if not isinstance(should_select, bool):
+                    raise TypeError("select_current callback must return a boolean")
+            except BaseException as failure:
+                _report_cleanup_failures(_unlink_paths(staged_file), active_failure=failure)
+                raise
+
+            if not should_select:
+                _report_cleanup_failures(_unlink_paths(staged_file), active_failure=None)
+                return PaidVersionCommit(version=version, selected=False)
+
+            current_backup: Path | None = None
+            current_existed = current_file.is_file()
+            selection_succeeded = False
+            try:
+                current_file.parent.mkdir(parents=True, exist_ok=True)
+                if current_existed:
+                    current_backup = _create_rollback_backup(current_file)
+                os.replace(staged_file, current_file)
+                resource_data["current_version"] = version
+                self._save_versions(data)
+                if on_select is not None:
+                    on_select()
+                selection_succeeded = True
+                return PaidVersionCommit(version=version, selected=True)
+            except BaseException as failure:
+                selection_rollback_errors: list[OSError] = []
+                try:
+                    if current_backup is None:
+                        if not current_existed:
+                            current_file.unlink(missing_ok=True)
+                    else:
+                        os.replace(current_backup, current_file)
+                except OSError as exc:
+                    selection_rollback_errors.append(exc)
+                resource_data["current_version"] = prior_current
+                try:
+                    self._save_versions(data)
+                except OSError as exc:
+                    selection_rollback_errors.append(exc)
+                if selection_rollback_errors:
+                    selection_rollback_errors[0].__cause__ = failure
+                    raise RuntimeError(
+                        "paid version selection failed and durable rollback was incomplete"
+                    ) from selection_rollback_errors[0]
+                raise
+            finally:
+                cleanup_failures = _unlink_paths(staged_file, current_backup if selection_succeeded else None)
+                _report_cleanup_failures(cleanup_failures, active_failure=sys.exception())
 
     def reject_current_version(
         self,
@@ -389,18 +856,13 @@ class VersionManager:
                 raise ValueError(f"restore version does not exist: {restore_version}")
             versions_snapshot = self.versions_file.read_bytes()
             current_backup: Path | None = None
+            current_existed = current_file.is_file()
             replacement: Path | None = None
+            rejection_succeeded = False
             try:
                 current_file.parent.mkdir(parents=True, exist_ok=True)
-                if current_file.is_file():
-                    fd, backup_name = tempfile.mkstemp(
-                        prefix=f".{current_file.stem}.",
-                        suffix=f"{current_file.suffix}.rollback",
-                        dir=current_file.parent,
-                    )
-                    os.close(fd)
-                    current_backup = Path(backup_name)
-                    shutil.copy2(current_file, current_backup)
+                if current_existed:
+                    current_backup = _create_rollback_backup(current_file)
                 if previous is None:
                     current_file.unlink(missing_ok=True)
                     resource_data["current_version"] = 0
@@ -422,15 +884,16 @@ class VersionManager:
                 self._save_versions(data)
                 if on_reject is not None:
                     on_reject()
+                rejection_succeeded = True
                 return True
-            except BaseException:
+            except BaseException as failure:
                 rollback_errors: list[OSError] = []
                 try:
                     if current_backup is None:
-                        current_file.unlink(missing_ok=True)
+                        if not current_existed:
+                            current_file.unlink(missing_ok=True)
                     else:
                         os.replace(current_backup, current_file)
-                        current_backup = None
                 except OSError as exc:
                     rollback_errors.append(exc)
                 try:
@@ -438,15 +901,17 @@ class VersionManager:
                 except OSError as exc:
                     rollback_errors.append(exc)
                 if rollback_errors:
+                    rollback_errors[0].__cause__ = failure
                     raise RuntimeError(
                         "version rejection failed and durable rollback was incomplete"
                     ) from rollback_errors[0]
                 raise
             finally:
-                if current_backup is not None:
-                    current_backup.unlink(missing_ok=True)
-                if replacement is not None:
-                    replacement.unlink(missing_ok=True)
+                cleanup_failures = _unlink_paths(
+                    replacement,
+                    current_backup if rejection_succeeded else None,
+                )
+                _report_cleanup_failures(cleanup_failures, active_failure=sys.exception())
 
     def rename_resource(self, resource_type: str, old_id: str, new_id: str, *, dry_run: bool = False) -> int:
         """把资源的版本历史整体迁移到新 id：re-key 元数据、重命名快照文件、改写记录内路径。
@@ -568,7 +1033,15 @@ class VersionManager:
                 **metadata,
             )
 
-    def restore_version(self, resource_type: str, resource_id: str, version: int, current_file: Path) -> dict:
+    def restore_version(
+        self,
+        resource_type: str,
+        resource_id: str,
+        version: int,
+        current_file: Path,
+        *,
+        on_restore: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict:
         """
         切换到指定版本
 
@@ -608,11 +1081,47 @@ class VersionManager:
             if not target_file.exists():
                 raise FileNotFoundError(f"版本文件不存在: {target_file}")
 
-            current_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(target_file, current_file)
-
-            resource_data["current_version"] = version
-            self._save_versions(data)
+            versions_existed = self.versions_file.is_file()
+            versions_snapshot = self.versions_file.read_bytes() if versions_existed else None
+            current_backup: Path | None = None
+            current_existed = current_file.is_file()
+            restore_succeeded = False
+            try:
+                current_file.parent.mkdir(parents=True, exist_ok=True)
+                if current_existed:
+                    current_backup = _create_rollback_backup(current_file)
+                shutil.copy2(target_file, current_file)
+                resource_data["current_version"] = version
+                self._save_versions(data)
+                if on_restore is not None:
+                    on_restore(dict(target_version))
+                restore_succeeded = True
+            except BaseException as failure:
+                rollback_errors: list[OSError] = []
+                try:
+                    if current_backup is None:
+                        if not current_existed:
+                            current_file.unlink(missing_ok=True)
+                    else:
+                        os.replace(current_backup, current_file)
+                except OSError as exc:
+                    rollback_errors.append(exc)
+                try:
+                    if versions_snapshot is None:
+                        self.versions_file.unlink(missing_ok=True)
+                    else:
+                        atomic_write_bytes(self.versions_file, versions_snapshot)
+                except OSError as exc:
+                    rollback_errors.append(exc)
+                if rollback_errors:
+                    rollback_errors[0].__cause__ = failure
+                    raise RuntimeError(
+                        "version restore failed and durable rollback was incomplete"
+                    ) from rollback_errors[0]
+                raise
+            finally:
+                if restore_succeeded:
+                    _report_cleanup_failures(_unlink_paths(current_backup), active_failure=sys.exception())
 
         restored_prompt = target_version.get("prompt", "")
         return {

@@ -4,65 +4,81 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import tool
 
-from lib.config.resolver import video_bucket_for_generation_mode
-from lib.db import async_session_factory
+from lib.artifact_activation import (
+    ArtifactCurrencyResolver,
+    active_artifact_currency_resolver,
+    artifact_is_usable,
+    resolve_artifact_episode,
+)
+from lib.artifact_manifest import ArtifactKey, ArtifactManifestError, ArtifactStatus
+from lib.batch_admission import (
+    BatchAdmission,
+    BatchAdmissionDecision,
+    UnitAdmissionTicket,
+    refused_ticket,
+)
 from lib.generation_queue_client import (
+    BatchEnqueueAborted,
     BatchTaskResult,
     TaskSpec,
     batch_enqueue_and_wait,
-    enqueue_and_wait,
-    get_active_tasks_for_resources,
 )
-from lib.narration_delivery import (
-    NarratedVideoDurationPreparation,
-    video_request_cost_unavailable_problem,
-    video_request_requires_exact_quote,
-    video_request_reuses_current_visual,
+from lib.generation_result import (
+    GenerationAction,
+    GenerationBatchResult,
+    GenerationCandidate,
+    GenerationProblem,
+    GenerationProblemCode,
+    GenerationResultBuilder,
+    GenerationSelectionMode,
+    GenerationTargetState,
+    artifact_is_reusable,
+    normalize_requested_ids,
+    record_batch_outcomes,
+    select_generation_targets,
 )
 from lib.project_manager import ProjectManager, is_reference_video_project
-from lib.prompt_utils import (
-    build_drama_video_prompt,
-    build_drama_video_prompt_from_legacy_dialogue,
-    is_structured_video_prompt,
-    strip_voice_profiles,
-    video_prompt_to_yaml,
-)
-from lib.reference_video import assemble_shots_text
 from lib.reference_video.request_projection import (
     POST_PRODUCTION,
     USE_TTS,
     ReferenceRequestOptions,
-    ReferenceUnitRequestProjection,
-    project_reference_unit_request,
 )
 from lib.script_models import get_generated_assets, resolve_content_mode
 from lib.script_skeleton import ensure_route_skeleton, resolve_script_kind
 from lib.speech_composition import (
     SpeechAdmissionError,
-    require_script_unit_admitted,
     video_unit_replan_problems,
 )
-from lib.storyboard_sequence import get_storyboard_items, resolve_storyboard_image_ref
+from lib.storyboard_sequence import get_storyboard_items
+from lib.version_manager import VersionManager
 from server.agent_runtime.sdk_tools._context import (
     ToolContext,
+    generation_result_response,
     tool_error,
     validate_script_filename,
 )
-from server.services.cost_estimation import quote_video_request
-from server.services.narration_delivery_tasks import (
-    active_tts_resource_ids,
-    prepare_current_reference_video_request_options,
-    prepare_current_storyboard_narrated_video_duration,
+from server.services.video_batch_admission import (
+    admit_reference_video_batch,
+    admit_storyboard_video_request,
+    artifact_state_tickets,
+    build_storyboard_video_specs,
+    diagnostic_unit_id,
+    reference_unit_task_spec,
+    request_options_for_unit,
+    resolve_voice_context,
+    screen_script_entries,
+    speech_admission_ticket,
+    storyboard_item_id,
+    video_target_states,
 )
-from server.services.video_caps import assert_audio_switch_supported, resolve_project_is_silent
 
 _CONFIRMED_REQUEST_DURATION_SCHEMA_PROPERTY = {
     "type": "integer",
@@ -73,17 +89,108 @@ _CONFIRMED_REQUEST_DURATION_SCHEMA_PROPERTY = {
     ),
 }
 
+_CONFIRMED_REQUEST_DURATIONS_SCHEMA_PROPERTY = {
+    "type": "object",
+    "additionalProperties": {"type": "integer", "minimum": 1},
+    "description": (
+        '按 unit_id 记的档位确认（{"E1U1": 8}）；一次请求里多个 unit 档位不同时用它，'
+        "让原目标集合仍作为一批重发。与 confirmed_request_duration_seconds 同时给出时，本字段按 unit 覆盖。"
+    ),
+}
+
 _NARRATION_DELIVERY_SCHEMA_PROPERTY = {
     "type": "string",
     "enum": [POST_PRODUCTION, USE_TTS],
-    "description": "本次旁白交付方式；use_tts 只使用当前 fresh TTS 的实际媒体时长。",
+    "description": (
+        "本次旁白交付方式，必填；use_tts 只使用当前 fresh TTS 的实际媒体时长，post_production 不因 TTS 缺失或过期受阻。"
+    ),
 }
 
 
+_EPISODE_OPERATION = "generate_video_episode"
+_SCENE_OPERATION = "generate_video_scene"
+_ALL_OPERATION = "generate_video_all"
+_SELECTED_OPERATION = "generate_video_selected"
+
+
+def _batch_video_is_reusable(
+    *,
+    currency: ArtifactCurrencyResolver | None,
+    versions: VersionManager,
+    episode: int,
+    resource_type: str,
+    resource_id: str,
+    artifact_path: object,
+) -> bool:
+    """Admit a batch skip from either verified currency or one exact raw upload."""
+
+    return artifact_is_usable(
+        currency,
+        ArtifactKey.episode_video(episode, resource_id) if currency is not None else None,
+        artifact_path,
+    ) or versions.selected_manual_upload_matches_current_file(
+        resource_type,
+        resource_id,
+        artifact_path,
+    )
+
+
+def _state_for(states: dict[str, GenerationTargetState], unit_id: str) -> GenerationTargetState:
+    return states.get(unit_id) or GenerationTargetState(candidate=GenerationCandidate(unit_id=unit_id))
+
+
+def _currency_reusable_ids(
+    states: dict[str, GenerationTargetState],
+    already_done: list[str],
+    *,
+    manifest_active: bool,
+    project_dir: Path,
+) -> list[str]:
+    """Missing-only ids that active currency already reports current/stale.
+
+    The checkpoint's ``completed_scenes`` only tracks what *this* batch (or a
+    previous resumed attempt) has submitted — a fresh ``resume=false`` call
+    always starts it empty. Without this, missing-only would regenerate every
+    scene on a plain (non-resume) episode call even when its video_clip is
+    already current, billing for a full re-run of a request that named no ID.
+    """
+
+    done = set(already_done)
+    return [
+        unit_id
+        for unit_id, state in states.items()
+        if unit_id not in done and artifact_is_reusable(state, manifest_active=manifest_active, project_dir=project_dir)
+    ]
+
+
+def _sole_speech_admission(result: GenerationBatchResult) -> dict[str, Any]:
+    """整个请求只卡在一个单元的发声准入上时，把准入载荷原样带回响应顶层。
+
+    单元级的定位信息（哪一句台词、哪条路径）比逐 ID 契约细一层，点名单个单元的调用方
+    需要它才能一步定位到要改的地方；批量请求没有「这一个」单元可指，就不带。
+    """
+
+    admissions = [
+        item.problem.params["speech_admission"]
+        for item in result.items
+        if item.problem is not None and "speech_admission" in item.problem.params
+    ]
+    if len(result.requested) == 1 and len(admissions) == 1:
+        return {"speech_admission": admissions[0]}
+    return {}
+
+
 def _reference_request_options(args: dict[str, Any]) -> ReferenceRequestOptions:
-    delivery = args.get("narration_delivery", POST_PRODUCTION)
+    """把工具入参折成一次请求的投影选项；交付方式缺省或非法一律拒绝，不入队任何任务。
+
+    交付方式决定整批走哪一套准入判据与哪一份时长基准（TTS 实测 vs 剧本计划），
+    替调用方挑一个默认值会让一批视频按它没声明过的交付方式准入并计费。
+    storyboard 与 reference 两条路线都经这里取交付方式，判定只有这一处。
+    """
+
+    delivery = args.get("narration_delivery")
     if delivery not in (POST_PRODUCTION, USE_TTS):
-        delivery = POST_PRODUCTION
+        raise ValueError(f"narration_delivery 必填，合法值：{POST_PRODUCTION} | {USE_TTS}，收到 {delivery!r}")
     raw_confirmed = args.get("confirmed_request_duration_seconds")
     confirmed: int | None = None
     if raw_confirmed is not None:
@@ -96,12 +203,25 @@ def _reference_request_options(args: dict[str, Any]) -> ReferenceRequestOptions:
     )
 
 
-def _batch_reference_request_options(args: dict[str, Any]) -> ReferenceRequestOptions:
-    """Preserve batch duration confirmation without exposing narration delivery."""
+def _confirmed_request_durations(args: dict[str, Any]) -> dict[str, int]:
+    """取按 unit 记的档位确认。
 
-    return _reference_request_options(
-        {"confirmed_request_duration_seconds": args.get("confirmed_request_duration_seconds")}
-    )
+    整批只有一个档位时标量入参就够用；档位不止一个时必须按 unit 记，否则调用方只能
+    拆成几次调用，而拆开之后先入队的那一档已经花掉了钱，原目标集合再也无法作为一批
+    重新评估。
+    """
+
+    raw = args.get("confirmed_request_durations")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"confirmed_request_durations 必须是 unit_id 到秒数档位的对象，收到 {type(raw).__name__}")
+    confirmed: dict[str, int] = {}
+    for unit_id, seconds in raw.items():
+        if not isinstance(seconds, int) or isinstance(seconds, bool) or seconds <= 0:
+            raise ValueError(f"confirmed_request_durations[{unit_id!r}] 必须是大于 0 的整数秒档位，收到 {seconds!r}")
+        confirmed[str(unit_id)] = seconds
+    return confirmed
 
 
 def _speech_admission_error(name: str, exc: SpeechAdmissionError, log: list[str] | None = None) -> dict[str, Any]:
@@ -117,14 +237,6 @@ def _speech_admission_error(name: str, exc: SpeechAdmissionError, log: list[str]
 
 
 @dataclass(frozen=True)
-class DurationConfirmationPending:
-    """待确认的 unit 时长清单：申请档位与请求时长基准不一致，尚未入队任何任务。"""
-
-    items: list[dict[str, Any]]
-    projections: list[dict[str, object]]
-
-
-@dataclass(frozen=True)
 class ReferenceGenerationComplete:
     """参考单元生成结果与入队前 current-state 投影。"""
 
@@ -132,228 +244,112 @@ class ReferenceGenerationComplete:
     projections: list[dict[str, object]]
 
 
-class ReferenceProjectionBlocked(ValueError):
-    """参考单元的公共投影未通过；保留结构化 problems 供 Agent 错误信封返回。"""
+@dataclass(frozen=True)
+class BatchAdmissionRefused:
+    """整批准入未通过：本次调用不产生任何任务。"""
 
-    def __init__(self, projection: dict[str, object]) -> None:
-        self.projection = projection
-        super().__init__(f"unit {projection['unit_id']} 请求投影未通过")
-
-
-def _reference_projection_error(
-    name: str,
-    exc: ReferenceProjectionBlocked,
-    log: list[str] | None = None,
-) -> dict[str, Any]:
-    details = json.dumps(exc.projection["problems"], ensure_ascii=False)
-    text = f"{name} 失败: {exc}；problems={details}"
-    if log:
-        text = "\n".join([text, *log])
-    return {
-        "content": [{"type": "text", "text": text}],
-        "is_error": True,
-        "request_projection": exc.projection,
-    }
+    admission: BatchAdmission
 
 
-def _duration_confirmation_response(pending: DurationConfirmationPending, log: list[str]) -> dict[str, Any]:
-    """把待确认清单连同调用期间产生的 log 一并交给调用方转述。
-
-    log 携带的是同样影响生成范围的事实（如 scene_id 被忽略转整集、ad 派生出的 unit 数），
-    确认时一并呈现，用户才知道自己同意的是什么范围。
-    """
-    lines = [*log, "以下 unit 将改用不同的视频时长档位，需先向用户确认，本次未入队任何任务："]
-    for item in pending.items:
-        duration_input = item["duration_input"]
-        script_duration = item["script_duration"]
-        current_visual_duration = item.get("current_visual_duration")
-        has_current_visual = isinstance(current_visual_duration, int) and not isinstance(current_visual_duration, bool)
-        baseline_duration = current_visual_duration if has_current_visual else script_duration
-        request_duration = item["request_duration"]
-        longer_or_shorter = "更长" if request_duration > baseline_duration else "更短"
-        tier_basis = f"现有视觉档位 {baseline_duration}s" if has_current_visual else f"剧本档位 {baseline_duration}s"
-        basis = (
-            f"剧本 {script_duration}s、含实际旁白后的时长基准 {duration_input}s"
-            if duration_input != script_duration
-            else f"剧本总时长 {script_duration}s"
+def _confirmation_lines(admission: BatchAdmission) -> list[str]:
+    lines = ["以下 unit 将改用不同的视频时长档位，需先向用户确认，本次未入队任何任务："]
+    for tier in admission.confirmation_tiers():
+        # 档位解析不出来时该组没有可确认的秒数，照实说明；插值出 "None s 档位" 会让调用方
+        # 以为存在一个叫 None 的档位。
+        tier_label = (
+            f"{tier.request_duration_seconds}s 档位" if tier.request_duration_seconds is not None else "档位待定"
         )
-        difference = abs(request_duration - baseline_duration)
+        headline = f"- {tier_label} × {tier.unit_count}：{'、'.join(tier.unit_ids)}"
+        if tier.cost_amount is not None:
+            headline += f"；合计 {tier.cost_amount} {tier.cost_currency}"
+        lines.append(headline)
+    for ticket in admission.tickets:
+        if not ticket.confirmation_only:
+            continue
+        params = ticket.problems[0].params
+        baseline = ticket.current_duration_seconds
+        requested = ticket.request_duration_seconds
+        tier_basis = (
+            f"现有视觉档位 {baseline}s" if isinstance(baseline, int) else f"剧本档位 {params.get('script_duration')}s"
+        )
+        # 与现有成片的差值直接给出：档位数字本身不说明成片会变长还是变短。
+        delta = ""
+        if isinstance(baseline, int) and isinstance(requested, int) and requested != baseline:
+            direction = "更长" if requested > baseline else "更短"
+            delta = f"（成片{direction} {abs(requested - baseline)}s）"
+        requested_label = f"{requested}s" if isinstance(requested, int) else "档位待定"
         lines.append(
-            f"- {item['unit_id']}：{tier_basis}，将申请 {request_duration}s"
-            f"（成片{longer_or_shorter} {difference}s）；{basis}"
+            f"  · {ticket.unit_id}：{tier_basis}，将申请 {requested_label}{delta}，"
+            f"时长基准 {params.get('duration_input')}s"
         )
-        request_cost = item.get("request_cost")
-        if isinstance(request_cost, dict):
-            lines.append(
-                "  新视频请求费用："
-                f"{request_cost['amount']} {request_cost['currency']}；"
-                f"{request_cost['provider_id']}/{request_cost['model_id']}；"
-                f"请求 {request_cost['request_duration_seconds']}s"
-            )
     lines.append(
-        "视频费用按上述申请档位计算，确认仅对本次请求有效。用户同意某个申请档位后，带 "
-        "confirmed_request_duration_seconds=<request_duration> 再次调用；若多个 unit 档位不同，"
-        "请按档位分组调用。"
+        "视频费用按上述申请档位计算，确认仅对本次请求有效。用户同意后，带 "
+        "confirmed_request_durations={<unit_id>: <request_duration>} 把原来这一批目标一次性重发；"
+        "整批只有一个档位时也可以用 confirmed_request_duration_seconds=<request_duration>。"
+        "不要按档位拆成多次调用——先入队的那一档已经花了钱，这批目标就不再是一次全有或全无的请求。"
     )
-    return {
+    return lines
+
+
+def _blocked_lines(admission: BatchAdmission) -> list[str]:
+    lines = ["本次批量请求未通过准入，未入队任何任务。逐 unit 缺口如下："]
+    for ticket in admission.refused_tickets:
+        for problem in ticket.problems:
+            lines.append(f"- {ticket.unit_id}：{problem.code}（下一步：{problem.action.value}）{problem.detail}")
+    lines.append("修复全部缺口后重试即可一次性提交整批。")
+    return lines
+
+
+def _batch_admission_response(
+    refusal: BatchAdmissionRefused,
+    log: list[str],
+    builder: GenerationResultBuilder,
+    states: dict[str, GenerationTargetState] | None = None,
+) -> dict[str, Any]:
+    """转述整批拒绝：零任务入队，每个目标都带自己的机器可读结论。
+
+    待确认档位是入队前的正常拦截点，不是异常——``is_error`` 不跟着 blocked 走，
+    这批 unit 仍等待用户决定，不代表请求失败。
+    """
+
+    admission = refusal.admission
+    admission.record_refusal(builder, states=states)
+    confirmation = admission.decision is BatchAdmissionDecision.CONFIRMATION_REQUIRED
+    lines = [*log, *(_confirmation_lines(admission) if confirmation else _blocked_lines(admission))]
+    result = builder.build()
+    response: dict[str, Any] = {
         "content": [{"type": "text", "text": "\n".join(lines)}],
-        "request_projections": pending.projections,
+        "generation_result": result.model_dump(mode="json"),
+        "batch_admission": admission.to_payload(),
+        "request_projections": admission.projections(),
+        **_sole_speech_admission(result),
     }
+    if not confirmation:
+        response["is_error"] = True
+    return response
 
 
-def _agent_projection_payload(projection: ReferenceUnitRequestProjection) -> dict[str, object]:
-    return projection.to_advisory_payload()
-
-
-async def _reference_projection_preflight(
-    *,
-    project: dict[str, Any],
-    project_path: Path,
-    script: dict[str, Any],
-    units: list[Any],
-    skip_ids: set[str],
-    spec_for: Callable[[Any], TaskSpec],
+def _apply_delivery_payload(
+    specs: list[TaskSpec],
     request_options: ReferenceRequestOptions,
-    project_name: str | None = None,
-    script_filename: str | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, object]]]:
-    """用公共投影一次性完成 Agent 入口的资产、能力、音频与时长预检。"""
+    confirmed_request_durations: Mapping[str, int],
+) -> None:
+    """Attach this request's delivery choice to every admitted storyboard spec.
 
-    if request_options.narration_delivery == USE_TTS and project_name is None:
-        raise ValueError("use_tts reference projection requires project_name")
-    items: list[dict[str, Any]] = []
-    projections: list[dict[str, object]] = []
-    target_ids = [str(unit.get("unit_id") or "") for unit in units if isinstance(unit, dict) and unit.get("unit_id")]
-    active_tts = (
-        await active_tts_resource_ids(
-            project_name=project_name,
-            resource_ids=target_ids,
-            script_file=script_filename,
-        )
-        if (request_options.narration_delivery == USE_TTS and project_name is not None and script_filename is not None)
-        else frozenset()
-    )
-    for unit in units:
-        if not isinstance(unit, dict):
-            continue
-        unit_id = str(unit.get("unit_id") or "")
-        if not unit_id or unit_id in skip_ids:
-            continue
-        try:
-            spec_for(unit)
-        except ValueError:
-            continue
-        current_options = await prepare_current_reference_video_request_options(
-            project=project,
-            script=script,
-            script_file=script_filename,
-            unit=unit,
-            project_path=project_path,
-            options=request_options,
-            project_name=project_name or "",
-            tts_in_progress=unit_id in active_tts,
-        )
-        projection = await project_reference_unit_request(
-            project=project,
-            script=script,
-            unit=unit,
-            project_path=project_path,
-            options=current_options,
-            tts_in_progress=unit_id in active_tts,
-            current_options_materialized=True,
-        )
-        projection_payload = _agent_projection_payload(projection)
-        cost_problem_payload: dict[str, object] | None = None
-        projection_cost = getattr(projection, "cost", None)
-        if projection_cost is not None and current_options.narration_delivery == USE_TTS:
-            quote = await quote_video_request(projection_cost, async_session_factory)
-            if quote is not None:
-                if current_options.narration_delivery == USE_TTS and video_request_reuses_current_visual(
-                    request_duration_seconds=projection_cost.duration_seconds,
-                    current_reusable_visual_duration_seconds=(current_options.current_reusable_visual_duration_seconds),
-                ):
-                    quote = quote.without_new_video_charge()
-                projection_payload["request_cost"] = quote.to_payload()
-            elif video_request_requires_exact_quote(
-                request_duration_seconds=projection_cost.duration_seconds,
-                planned_duration_seconds=projection.planned_duration,
-                current_visual_duration_seconds=current_options.current_visual_duration_seconds,
-                current_reusable_visual_duration_seconds=(current_options.current_reusable_visual_duration_seconds),
-            ):
-                cost_problem_payload = video_request_cost_unavailable_problem(projection_cost).to_payload(
-                    unit_id=unit_id
-                )
-                existing_problems = projection_payload["problems"]
-                if not isinstance(existing_problems, list):
-                    raise RuntimeError("reference projection problems payload must be a list")
-                projection_payload["problems"] = [
-                    *existing_problems,
-                    cost_problem_payload,
-                ]
-                projection_payload["allowed"] = False
-        projections.append(projection_payload)
-        duration_problem = next(
-            (p for p in projection.blocking_problems if p.code == "reference_duration_confirmation_required"),
-            None,
-        )
-        other_blockers = [p for p in projection.blocking_problems if p is not duration_problem]
-        if cost_problem_payload is not None:
-            raise ReferenceProjectionBlocked(projection_payload)
-        if other_blockers:
-            raise ReferenceProjectionBlocked(projection_payload)
-        if duration_problem is not None:
-            params = duration_problem.parameters()
-            items.append(
-                {
-                    "unit_id": unit_id,
-                    "script_duration": params["script_duration"],
-                    "current_visual_duration": params.get("current_visual_duration"),
-                    "duration_input": params["duration_input"],
-                    "request_duration": params["request_duration"],
-                    "adjustment": params["adjustment"],
-                    **(
-                        {"request_cost": projection_payload["request_cost"]}
-                        if "request_cost" in projection_payload
-                        else {}
-                    ),
-                }
-            )
-    return items, projections
+    TTS 的取档结果是当前状态投影，不是耐久请求事实。worker 起跑时会从最新剧本 unit、
+    fresh TTS 与当前模型能力重投影；即使 TaskSpec 的旧构造器放入 duration_seconds，
+    这里也必须剥离。跨档确认按 unit 记入各自的请求事实——worker 重投影时读的是任务上的
+    这份选项，只写整批共用的那一份会让准入已接受的档位在执行期重新变成待确认。
+    """
+
+    for spec in specs:
+        unit_options = request_options_for_unit(request_options, spec.resource_id, confirmed_request_durations)
+        spec.payload = {**(spec.payload or {}), "narration_delivery_options": unit_options.to_payload()}
+        if request_options.narration_delivery == USE_TTS:
+            spec.payload.pop("duration_seconds", None)
 
 
-async def _prepare_storyboard_delivery_for_item(
-    *,
-    ctx: ToolContext,
-    project: dict[str, Any],
-    script: dict[str, Any],
-    script_filename: str,
-    item: dict[str, Any],
-    visual_prompt: object,
-    confirmed_request_duration_seconds: int | None,
-    tts_in_progress: bool,
-) -> NarratedVideoDurationPreparation:
-    """Adapt Agent inputs to the shared storyboard delivery service."""
-
-    planned = item.get("duration_seconds")
-    return await prepare_current_storyboard_narrated_video_duration(
-        project_name=ctx.project_name,
-        project=project,
-        project_path=ctx.project_path,
-        script=script,
-        script_file=script_filename,
-        item=item,
-        visual_prompt=visual_prompt,
-        seed=None,
-        capability=video_bucket_for_generation_mode(project.get("generation_mode")),
-        planned_duration_seconds=(
-            planned if isinstance(planned, int) and not isinstance(planned, bool) and planned > 0 else None
-        ),
-        confirmed_request_duration_seconds=confirmed_request_duration_seconds,
-        tts_in_progress=tts_in_progress,
-    )
-
-
-async def _prepare_storyboard_delivery_specs(
+async def _admit_storyboard_specs(
     *,
     ctx: ToolContext,
     project: dict[str, Any],
@@ -363,165 +359,49 @@ async def _prepare_storyboard_delivery_specs(
     id_field: str,
     specs: list[TaskSpec],
     request_options: ReferenceRequestOptions,
-) -> DurationConfirmationPending | None:
-    """Apply delivery choice to pending storyboard specs before any task is submitted."""
+    confirmed_request_durations: Mapping[str, int],
+    operation: str,
+    selection: GenerationSelectionMode,
+    extra_tickets: list[UnitAdmissionTicket],
+) -> BatchAdmission:
+    """Admit the storyboard-route specs, then stamp the delivery choice onto them.
 
-    request_facts = request_options.to_payload()
-    items_by_id = {
-        str(item.get(id_field) or item.get("scene_id") or item.get("segment_id") or ""): item for item in items
-    }
-    pending: list[dict[str, Any]] = []
-    projections: list[dict[str, object]] = []
-    active_tts = (
-        await active_tts_resource_ids(
-            project_name=ctx.project_name,
-            resource_ids=(spec.resource_id for spec in specs),
-            script_file=script_filename,
-        )
-        if request_options.narration_delivery == USE_TTS
-        else frozenset()
+    The admission itself is the shared one the read-only plan also consults, so a
+    preview and the submission it predicts cannot reach different verdicts. Only the
+    payload stamping is enqueue-side: it is a request fact, not part of the basis the
+    admission compares.
+    """
+
+    admission = await admit_storyboard_video_request(
+        project_name=ctx.project_name,
+        project=project,
+        project_path=ctx.project_path,
+        script=script,
+        script_file=script_filename,
+        items=items,
+        id_field=id_field,
+        specs=specs,
+        request_options=request_options,
+        confirmed_request_durations=confirmed_request_durations,
+        operation=operation,
+        selection=selection,
+        extra_tickets=extra_tickets,
     )
-    for spec in specs:
-        spec.payload = {
-            **(spec.payload or {}),
-            "narration_delivery_options": request_facts,
-        }
-        if request_options.narration_delivery != USE_TTS:
-            continue
-        # TTS 的取档结果是当前状态投影，不是耐久请求事实。worker 起跑时会从最新
-        # 剧本 unit、fresh TTS 与当前模型能力重投影；即使 TaskSpec 的旧构造器放入
-        # duration_seconds，这里也必须剥离。
-        spec.payload.pop("duration_seconds", None)
-        item = items_by_id.get(spec.resource_id)
-        if item is None:
-            raise ValueError(f"找不到待生成条目: {spec.resource_id}")
-        preparation = await _prepare_storyboard_delivery_for_item(
-            ctx=ctx,
-            project=project,
-            script=script,
-            script_filename=script_filename,
-            item=item,
-            visual_prompt=(spec.payload or {}).get("prompt"),
-            confirmed_request_duration_seconds=request_options.confirmed_request_duration_seconds,
-            tts_in_progress=spec.resource_id in active_tts,
-        )
-        projection = preparation.to_payload()
-        cost_problem_payload: dict[str, object] | None = None
-        if preparation.cost is not None:
-            quote = await quote_video_request(preparation.cost, async_session_factory)
-            if quote is not None:
-                if video_request_reuses_current_visual(
-                    request_duration_seconds=preparation.request_duration_seconds,
-                    current_reusable_visual_duration_seconds=preparation.current_reusable_visual_duration_seconds,
-                ):
-                    quote = quote.without_new_video_charge()
-                projection["request_cost"] = quote.to_payload()
-            elif video_request_requires_exact_quote(
-                request_duration_seconds=preparation.request_duration_seconds,
-                planned_duration_seconds=preparation.planned_duration_seconds,
-                current_visual_duration_seconds=preparation.current_visual_duration_seconds,
-                current_reusable_visual_duration_seconds=preparation.current_reusable_visual_duration_seconds,
-            ):
-                cost_problem_payload = video_request_cost_unavailable_problem(preparation.cost).to_payload(
-                    unit_id=preparation.narration.unit_id
-                )
-                existing_problems = projection["problems"]
-                if not isinstance(existing_problems, list):
-                    raise RuntimeError("storyboard projection problems payload must be a list")
-                projection["problems"] = [*existing_problems, cost_problem_payload]
-                projection["allowed"] = False
-        projections.append(projection)
-        duration_problem = next(
-            (
-                problem
-                for problem in preparation.problems
-                if problem.blocking and problem.code == "reference_duration_confirmation_required"
-            ),
-            None,
-        )
-        other_blockers = [
-            problem for problem in preparation.problems if problem.blocking and problem is not duration_problem
-        ]
-        if cost_problem_payload is not None:
-            raise ReferenceProjectionBlocked(projection)
-        if other_blockers:
-            raise ReferenceProjectionBlocked(projection)
-        if duration_problem is not None:
-            params = duration_problem.parameters()
-            pending.append(
-                {
-                    "unit_id": preparation.narration.unit_id,
-                    "script_duration": params["script_duration"],
-                    "current_visual_duration": params.get("current_visual_duration"),
-                    "duration_input": params["duration_input"],
-                    "request_duration": params["request_duration"],
-                    "adjustment": params["adjustment"],
-                    **({"request_cost": projection["request_cost"]} if "request_cost" in projection else {}),
-                }
-            )
-            continue
-    if pending:
-        return DurationConfirmationPending(items=pending, projections=projections)
-    return None
+    if admission.admitted:
+        _apply_delivery_payload(specs, request_options, confirmed_request_durations)
+    return admission
 
 
-def _get_video_prompt(
-    item: dict[str, Any], *, content_mode: str, voice_characters: dict[str, Any] | None = None
-) -> str:
-    prompt = item.get("video_prompt")
-    if not prompt:
-        item_id = item.get("segment_id") or item.get("scene_id")
-        raise ValueError(f"片段/场景缺少 video_prompt 字段: {item_id}")
-    if is_structured_video_prompt(prompt):
-        # Voice_Profiles 声明段唯一来源是下方 build_drama_video_prompt 系的机械派生：剧本 JSON
-        # 里残留的 voice_profiles 一律先剥离，不因门控不触发（narration/ad、或 drama 无
-        # utterances 的条目）而绕过 C 类（真无声）门控直达 YAML。
-        prompt = strip_voice_profiles(prompt)
-        if content_mode == "drama":
-            # drama 口型台词单一真相源在场景级有序 utterances：取 dialogue-kind 注入 video YAML 的
-            # dialogue 出口（drama video_prompt 已不带 dialogue）。utterances 迁移前的存量剧本
-            # （load_script 按原始 JSON 读盘不过 pydantic，不会被 DramaScene._migrate_legacy
-            # 自动补齐）台词仍留在 video_prompt.dialogue，改走 legacy 出口。
-            if "utterances" in item:
-                prompt = build_drama_video_prompt(prompt, item.get("utterances"), characters=voice_characters)
-            else:
-                prompt = build_drama_video_prompt_from_legacy_dialogue(prompt, characters=voice_characters)
-        return video_prompt_to_yaml(prompt)
-    if isinstance(prompt, dict):
-        item_id = item.get("segment_id") or item.get("scene_id")
-        raise ValueError(f"片段/场景 video_prompt 为对象但格式不符合结构化规范: {item_id}")
-    if not isinstance(prompt, str):
-        item_id = item.get("segment_id") or item.get("scene_id")
-        raise TypeError(f"片段/场景 video_prompt 类型无效（期望 str 或 dict）: {item_id}")
-    return prompt
+def _enqueue_aborted_error(name: str, exc: BatchEnqueueAborted, log: list[str] | None = None) -> dict[str, Any]:
+    """回滚后的整批入队失败：明确说明哪些任务已撤销、哪些仍占用队列。"""
 
-
-async def _assert_audio_switch_for_storyboard(ctx: ToolContext) -> None:
-    """分镜路线入队前的音频闸门（``assert_audio_switch_supported``，与 WebUI 提交入口同一判据）。
-
-    成片恒有声的模型收不到关闭音频的请求，放行只会让无声判据把音色约束整批裁掉。闸门与内容模式
-    无关，narration/ad 同样受检。
-
-    调用点固定在「确有任务要入队」之后、提交之前：整集已完成、或条目全被
-    :func:`_build_video_specs` 过滤时本就不会产生任何请求，此时拒绝等于把一次正常的空转变成报错。
-    参考路线由公共 request projection 给出同一音频能力判定。
-    """
-    project = ctx.pm.load_project(ctx.project_name)
-    await assert_audio_switch_supported(project, video_bucket_for_generation_mode(project.get("generation_mode")))
-
-
-async def _resolve_voice_context(ctx: ToolContext, content_mode: str) -> dict[str, Any] | None:
-    """供 Voice_Profiles 注入的角色资产（``None`` 表示不注入）。
-
-    非 drama 不注入；drama 按无声判据排除（C 类模型不产音、或本集关闭了音频，两条路径同口径）。
-    台词不受影响、照常下发。
-    """
-    if content_mode != "drama":
-        return None
-    project = ctx.pm.load_project(ctx.project_name)
-    if await resolve_project_is_silent(project):
-        return None
-    return project.get("characters") or {}
+    text = (
+        f"{name} 失败: {exc}；本次已回滚 {len(exc.rolled_back)} 个任务，"
+        f"未回滚 {len(exc.orphaned)} 个（{'、'.join(exc.orphaned) or '无'}）"
+    )
+    if log:
+        text = "\n".join([text, *log])
+    return {"content": [{"type": "text", "text": text}], "is_error": True}
 
 
 def _resolve_reference_route(ctx: ToolContext, script: dict[str, Any]) -> str | None:
@@ -578,94 +458,138 @@ def _clear_checkpoint_at(path: Path) -> None:
         path.unlink()
 
 
-def _build_video_specs(
-    *,
-    items: list[dict[str, Any]],
+def _storyboard_item_aliases(item: dict[str, Any], id_field: str) -> set[str]:
+    """点名时能寻址到这个条目的全部写法。
+
+    各入口既认规范 ``id_field`` 也认 ``scene_id`` 别名，两者在剧本里可以不同；按哪一个
+    点名都要指到同一个条目，否则同一个名字在不同入口指向不同条目。
+    """
+
+    # 先按类型过滤再进集合：脏剧本里的 list / dict 别名不可哈希，直接建集合会抛 TypeError，
+    # 逐目标的拒绝契约就塌成一句通用报错。
+    aliases = (item.get(id_field), item.get("scene_id"))
+    return {alias.strip() for alias in aliases if isinstance(alias, str) and alias.strip()}
+
+
+def _screen_storyboard_items(
+    items: Sequence[Any],
     id_field: str,
-    content_mode: str,
-    script_filename: str,
-    project_dir: Path,
-    skip_ids: list[str] | None,
-    log: list[str],
-    voice_characters: dict[str, Any] | None = None,
-) -> tuple[list[TaskSpec], dict[str, int]]:
-    item_type = "片段" if content_mode == "narration" else "场景"
-    skip_set = set(skip_ids or [])
+    *,
+    requested_ids: Collection[str] | None,
+) -> tuple[list[dict[str, Any]], list[UnitAdmissionTicket]]:
+    """把剧本条目分成「能当目标的」与「成不了目标的」两份，后者按位置记名。
 
-    specs: list[TaskSpec] = []
-    order_map: dict[str, int] = {}
-    for idx, item in enumerate(items):
-        item_id = item.get(id_field) or item.get("scene_id") or item.get("segment_id") or f"item_{idx}"
-        if item_id in skip_set:
-            continue
+    非对象条目、id 不是字符串、id 为空、以及同一个 id 出现多次，都会让后面按 id 索引的每一步
+    失手：条目被静默滤掉时同批健康的目标独自入队计费，撞上集合查询时又把逐目标的拒绝契约打成
+    一句通用报错。数字与布尔 id 混过 ``str()`` 进队列后，执行期按原值比对同样找不到目标。
+    各入口在读 id 之前先经这一道筛，这些失手都变成一张记名的准入票。
 
-        storyboard_image = get_generated_assets(item).get("storyboard_image")
-        # 字段值来自磁盘剧本 JSON，不可信任：非字符串脏数据/越界/绝对路径引用统一交给
-        # resolve_storyboard_image_ref 校验（与路由入队预检、执行层读盘点共用同一份），
-        # 批量场景下单个条目非法只跳过并记日志，不中断整批。
-        try:
-            storyboard_path = resolve_storyboard_image_ref(project_dir, storyboard_image)
-        except ValueError as exc:
-            log.append(f"⚠️  {item_type} {item_id} 的分镜图引用无效，跳过: {exc}")
-            continue
-        if storyboard_path is None:
-            log.append(f"⚠️  {item_type} {item_id} 没有分镜图，跳过")
-            continue
-        if not storyboard_path.is_file():
-            log.append(f"⚠️  分镜图不存在: {storyboard_path}，跳过")
-            continue
+    缺失即生成把整个剧本当作目标集合，剧本里任何一处脏条目都参与判定；点名生成的目标集合由
+    调用方给定，只有点到的 id 上的脏（同一个 id 的副本）才参与，否则别处的脏数据会否决一次
+    精确点名的重做。
 
-        try:
-            prompt = _get_video_prompt(item, content_mode=content_mode, voice_characters=voice_characters)
-        except Exception as exc:  # noqa: BLE001
-            log.append(f"⚠️  {item_type} {item_id} 的 video_prompt 无效，跳过: {exc}")
+    记名用带方括号的位置写法，与合法 id 不共用命名空间：同名会让结果契约把两条不同的条目
+    当作同一个，写第二遍时 fail loud，用户拿到的又是一句通用报错。
+    """
+
+    clean: list[dict[str, Any]] = []
+    tickets: list[UnitAdmissionTicket] = []
+    seen: set[str] = set()
+    addressable: list[tuple[dict[str, Any], str]] = []
+    taken = {
+        str(storyboard_item_id(item, id_field)).strip()
+        for item in items
+        if isinstance(item, dict) and isinstance(storyboard_item_id(item, id_field), str)
+    }
+    named = set(requested_ids) if requested_ids is not None else None
+    if named is not None:
+        # 点名的 ID 也占着记名空间：点到剧本里没有的名字时上游还会记一条「不存在」，
+        # 诊断名与它同名会把两条并成一条。
+        taken |= named
+    refused_names: set[str] = set()
+    for index, item in enumerate(items):
+        detail: str | None = None
+        item_id = ""
+        if not isinstance(item, dict):
+            detail = f"该条目不是对象，当前为 {type(item).__name__}"
+        else:
+            raw_id = storyboard_item_id(item, id_field)
+            if raw_id is not None and not isinstance(raw_id, str):
+                detail = f"该条目的 ID 不是字符串，当前为 {type(raw_id).__name__}"
+            else:
+                item_id = (raw_id or "").strip()
+                if not item_id:
+                    detail = "该条目没有可用的 ID"
+        if detail is not None:
+            if named is None:
+                tickets.append(
+                    refused_ticket(
+                        diagnostic_unit_id(f"items[{index}]", taken),
+                        code=GenerationProblemCode.UNIT_REQUEST_INVALID,
+                        detail=detail,
+                        action=GenerationAction.FIX_INPUT,
+                    )
+                )
+            elif isinstance(item, dict):
+                # 点名点中的正好是这个脏条目：按点名的写法给结论，否则调用方只收到一句
+                # 「不存在」，而这个名字在剧本里明明有条目。
+                for name in sorted(_storyboard_item_aliases(item, id_field) & named):
+                    if name in refused_names:
+                        continue
+                    refused_names.add(name)
+                    tickets.append(
+                        refused_ticket(
+                            name,
+                            code=GenerationProblemCode.UNIT_REQUEST_INVALID,
+                            detail=detail,
+                            action=GenerationAction.FIX_INPUT,
+                        )
+                    )
             continue
+        if named is not None:
+            addressable.append((item, item_id))
+            continue
+        if item_id in seen:
+            tickets.append(
+                refused_ticket(
+                    diagnostic_unit_id(f"{item_id}#{index}", taken),
+                    code=GenerationProblemCode.UNIT_REQUEST_INVALID,
+                    detail=f"ID {item_id} 在剧本中重复出现",
+                    action=GenerationAction.FIX_INPUT,
+                )
+            )
+            continue
+        seen.add(item_id)
+        clean.append(item)
+    if named is None:
+        return clean, tickets
 
-        # duration 是能力维度，留待执行层在 provider 解析后校验（见 ADR-0001）；
-        # 原样透传调用方显式指定的值，不在入队侧做 int() 截断式归一化（否则会把
-        # 本应被执行层拒绝的非法值静默修正）。缺省由执行层按 caps 收口默认。
-        extra_payload: dict[str, Any] = {}
-        duration = item.get("duration_seconds")
-        if duration is not None:
-            extra_payload["duration_seconds"] = duration
-
-        specs.append(
-            TaskSpec.from_request(
-                task_type="video",
-                media_type="video",
-                resource_id=item_id,
-                prompt=prompt,
-                script_file=script_filename,
-                extra_payload=extra_payload or None,
+    # 点名可以用规范 ID，也可以用 ``scene_id`` 别名，两者在剧本里可以不同；执行期按规范 ID
+    # 定位目标。因此一个名字指到几个条目，要把「直接被它寻址的条目」连同「与之共用规范 ID
+    # 的兄弟」一起数：只按名字数会漏掉别名不同、规范 ID 相同的那种，各入口按各自的查法分别
+    # 选中头一个或末一个，同一次点名在不同入口做的是不同条目。
+    by_canonical: dict[str, list[dict[str, Any]]] = {}
+    for item, item_id in addressable:
+        by_canonical.setdefault(item_id, []).append(item)
+    ambiguous: set[int] = set()
+    for name in sorted(named - refused_names):
+        owners = {id(item) for item, _ in addressable if name in _storyboard_item_aliases(item, id_field)}
+        targets = {
+            id(sibling) for item, item_id in addressable if id(item) in owners for sibling in by_canonical[item_id]
+        }
+        if len(targets) <= 1:
+            continue
+        ambiguous |= targets
+        tickets.append(
+            refused_ticket(
+                name,
+                code=GenerationProblemCode.UNIT_REQUEST_INVALID,
+                detail=f"ID {name} 在剧本中指向多个条目",
+                action=GenerationAction.FIX_INPUT,
             )
         )
-        order_map[item_id] = idx
-    return specs, order_map
-
-
-def _reference_unit_spec(unit: Any, script_filename: str) -> TaskSpec:
-    """单 unit 的 TaskSpec 构造，供批量入队与时长预检共用同一份结构校验
-    （见 ADR-0001）——``TaskSpec.from_request`` 是「是否可入队」的唯一真相源，两处判断
-    不能各自维护一份、由此产生分歧（如预检放行了 build_specs 会拒绝的空提示词 unit）。
-    """
-    # 用 .get 归一化：缺失 unit_id 的坏数据（Agent 可裸写 script JSON）会被 from_request
-    # 当作空 resource_id 拒绝，而不是在此抛 KeyError 中断整批。
-    if not isinstance(unit, dict):
-        raise ValueError("unit 必须是对象")
-    unit_id = str(unit.get("unit_id") or "")
-    if unit.get("needs_replan") is True:
-        require_script_unit_admitted("video_units", unit)
-    if not unit.get("shots"):
-        raise ValueError("没有 shots")
-    spec = TaskSpec.from_request(
-        task_type="reference_video",
-        media_type="video",
-        resource_id=unit_id,
-        prompt=assemble_shots_text(unit["shots"]),
-        script_file=script_filename,
-    )
-    require_script_unit_admitted("video_units", unit)
-    return spec
+    clean.extend(item for item, _ in addressable if id(item) not in ambiguous)
+    return clean, tickets
 
 
 def _build_reference_specs(
@@ -673,29 +597,39 @@ def _build_reference_specs(
     units: list[Any],
     script_filename: str,
     skip_ids: list[str] | None,
-    log: list[str],
-) -> tuple[list[TaskSpec], dict[str, int]]:
+) -> tuple[list[TaskSpec], dict[str, int], list[UnitAdmissionTicket]]:
+    """Build the reference-route specs, refusing each unit that cannot be requested."""
+
     skip_set = set(skip_ids or [])
     specs: list[TaskSpec] = []
     order_map: dict[str, int] = {}
+    refused: list[UnitAdmissionTicket] = []
+    # 进到这里的 unit 已经过筛查 / 点名选取，unit_id 必为非空标量：不再为记名留兜底名字。
     for idx, unit in enumerate(units):
-        unit_id = str(unit.get("unit_id") or "") if isinstance(unit, dict) else ""
+        unit_id = str(unit["unit_id"])
         if unit_id in skip_set:
             continue
         # 任一 unit 不合法（没有 shots、空提示词、或 from_request 对空 resource_id 抛的
-        # 裸 ValueError）都跳过并告警，不让一个坏 unit 中断整批。TaskSpecValidationError
+        # 裸 ValueError）都记为受阻，不让一个坏 unit 中断整批。TaskSpecValidationError
         # 是 ValueError 子类，捕 ValueError 同时覆盖两者。
         try:
-            spec = _reference_unit_spec(unit, script_filename)
+            spec = reference_unit_task_spec(unit, script_filename)
         except SpeechAdmissionError as exc:
-            log.append(f"⚠️  {unit_id} 发声准入未通过，跳过：{json.dumps(exc.admission.to_dict(), ensure_ascii=False)}")
+            refused.append(speech_admission_ticket(unit_id, exc))
             continue
         except ValueError as exc:
-            log.append(f"⚠️  {unit_id} 入队校验未通过，跳过：{exc}")
+            refused.append(
+                refused_ticket(
+                    unit_id,
+                    code=GenerationProblemCode.UNIT_REQUEST_INVALID,
+                    detail=f"入队校验未通过：{exc}",
+                    action=GenerationAction.FIX_INPUT,
+                )
+            )
             continue
         specs.append(spec)
         order_map[unit_id] = idx
-    return specs, order_map
+    return specs, order_map, refused
 
 
 def _scan_completed_items(
@@ -703,16 +637,24 @@ def _scan_completed_items(
     id_field: str,
     completed_scenes: list[str],
     videos_dir: Path,
+    *,
+    episode: int,
+    resolver: ArtifactCurrencyResolver | None,
 ) -> tuple[list[Path | None], list[str], list[str]]:
-    """Pure scan: reconcile checkpoint claims against on-disk videos.
+    """Reconcile checkpoint claims against canonical videos and active currency.
 
     Returns ``(ordered_paths, already_done, completed_filtered)``:
     - ``ordered_paths[i]`` is the existing mp4 path for items[i] iff the
-      checkpoint claimed it AND the file is on disk; else ``None``.
+      checkpoint claimed it and it is reusable: legacy projects require the
+      file on disk, while active projects require its exact formal path to be
+      usable under the Manifest (which also rejects absent files); else ``None``.
     - ``already_done`` is the subset of items the caller can skip enqueueing.
-    - ``completed_filtered`` drops ids the checkpoint claimed but whose file
-      is missing — caller should write this back instead of mutating its
-      checkpoint list in place.
+    - ``completed_filtered`` drops ids whose checkpoint output is missing or
+      no longer admitted — caller should write this back instead of mutating
+      its checkpoint list in place.
+
+    A blocked Manifest comparison propagates so checkpoint resume fails loud;
+    silently regenerating a paid artifact would discard the corruption signal.
     """
     ordered_paths: list[Path | None] = [None] * len(items)
     already_done: list[str] = []
@@ -722,7 +664,17 @@ def _scan_completed_items(
         if item_id not in completed_scenes:
             continue
         video_output = videos_dir / f"scene_{item_id}.mp4"
-        if video_output.exists():
+        artifact_path = video_output.relative_to(videos_dir.parent).as_posix()
+        reusable = (
+            video_output.exists()
+            if resolver is None
+            else artifact_is_usable(
+                resolver,
+                ArtifactKey.episode_video(episode, str(item_id)),
+                artifact_path,
+            )
+        )
+        if reusable:
             ordered_paths[idx] = video_output
             already_done.append(item_id)
         else:
@@ -749,9 +701,8 @@ async def _submit_with_checkpoint(
     completed: list[str],
     fallback_relpath: Callable[[str], str],
     save_fn: Callable[[], None],
-    log: list[str],
-) -> list[BatchTaskResult]:
-    """Run a batch and update checkpoint per success. Returns failures.
+) -> tuple[list[BatchTaskResult], list[BatchTaskResult]]:
+    """Run a batch and update checkpoint per success. Returns ``(successes, failures)``.
 
     ``fallback_relpath`` is called only when the queue result lacks
     ``file_path``; reference_video tasks need a different naming convention
@@ -761,22 +712,16 @@ async def _submit_with_checkpoint(
     def on_success(br: BatchTaskResult) -> None:
         result = br.result or {}
         relative_path = result.get("file_path") or fallback_relpath(br.resource_id)
-        output_path = project_dir / relative_path
-        ordered_paths[order_map[br.resource_id]] = output_path
+        ordered_paths[order_map[br.resource_id]] = project_dir / relative_path
         completed.append(br.resource_id)
         save_fn()
-        log.append(f"    ✓ {output_path.name}")
 
-    def on_failure(br: BatchTaskResult) -> None:
-        log.append(f"    ✗ {br.resource_id}: {br.error}")
-
-    _, failures = await batch_enqueue_and_wait(
+    return await batch_enqueue_and_wait(
         project_name=project_name,
         specs=specs,
         on_success=on_success,
-        on_failure=on_failure,
+        atomic=True,
     )
-    return failures
 
 
 async def _generate_reference_units(
@@ -785,35 +730,39 @@ async def _generate_reference_units(
     units: list[Any],
     episode: int,
     resume: bool,
-    log: list[str],
+    builder: GenerationResultBuilder,
+    states: dict[str, GenerationTargetState],
+    resolver: ArtifactCurrencyResolver | None,
     checkpoint_path: Path | None,
-    build_specs: Callable[[list[Any], list[str], list[str]], tuple[list[TaskSpec], dict[str, int]]],
-    spec_for: Callable[[Any], TaskSpec],
+    build_specs: Callable[[list[Any], list[str]], tuple[list[TaskSpec], dict[str, int], list[UnitAdmissionTicket]]],
     project: dict[str, Any],
     script: dict[str, Any],
     script_filename: str,
     request_options: ReferenceRequestOptions,
+    confirmed_request_durations: Mapping[str, int],
     reuse_existing: Callable[[dict[str, Any]], bool],
-) -> ReferenceGenerationComplete | DurationConfirmationPending:
+    operation: str,
+    selection: GenerationSelectionMode,
+    extra_tickets: list[UnitAdmissionTicket] | None = None,
+) -> ReferenceGenerationComplete | BatchAdmissionRefused:
     """unit 批量生成的共享骨架：时长确认 + checkpoint 续传 + 已产出扫描 + 入队等待。
 
-    所有内容模式的 ``video_units`` 共用同一构造路径。``spec_for``
-    是同一份单 unit 构造逻辑，供时长预检判定可入队性，与 ``build_specs`` 不能有
-    第二份校验口径。
+    所有内容模式的 ``video_units`` 共用同一构造路径。``build_specs`` 是本批唯一的
+    可入队性口径：它先于准入运行，构造不出 TaskSpec 的 unit 直接带着自己的问题码
+    进入准入结论，不再被解析或报价。
 
     ``reuse_existing`` 决定磁盘上已存在的 ``{unit_id}.mp4`` 能否当作该 unit 的
     现行产物复用。调用方必须用持久化资产归属判定，不能只凭同名文件存在猜测；共享
     骨架还会先应用重规划闸门，迁移保留的旧产物不能让 ``needs_replan`` 单元绕过修复。
 
-    若跨档 unit 当前申请档位没有与 ``confirmed_request_duration_seconds`` 精确相等，
-    （见 :class:`lib.reference_video.request_projection.ReferenceUnitRequestProjector`），该调用
-    调用不产生任何任务，返回 :class:`DurationConfirmationPending` 供调用方转述给用户；
-    用户同意后调用方带对应档位重新调用完成入队（与 Web 端
-    ``duration-precheck`` 预检共用同一取档规则）。
+    准入是一次性的：全部目标由 :func:`admit_reference_video_batch` 一起评估，任一目标
+    有问题就返回 :class:`BatchAdmissionRefused`，本次调用不产生任何任务（与 Web 批量入口
+    共用同一份判定）。跨档 unit 的申请档位没有与 ``confirmed_request_duration_seconds``
+    精确相等时同样属于未通过，用户同意后调用方带对应档位重新调用完成入队。
 
-    ``checkpoint_path`` 为 None 表示生成不落 checkpoint：点名重新生成一律强制覆盖，
+    ``checkpoint_path`` 为 None 表示生成不落批次进度 checkpoint：点名重新生成一律强制覆盖，
     没有可续传的语义，写一份没有读者的进度文件只会在中断时留下垃圾，也会覆盖掉整集
-    生成留下的进度。
+    生成留下的进度。每个入队任务在 provider 提交边界使用的 execution checkpoint 是独立机制。
     """
     project_dir = ctx.project_path
     ckpt_path = checkpoint_path
@@ -830,6 +779,8 @@ async def _generate_reference_units(
 
     ordered_paths: list[Path | None] = [None] * len(units)
     already_done: list[str] = []
+    manifest_blocked: list[str] = []
+    refused: list[UnitAdmissionTicket] = list(extra_tickets or [])
     for idx, unit in enumerate(units):
         if not isinstance(unit, dict):
             continue
@@ -837,33 +788,67 @@ async def _generate_reference_units(
         if not unit_id:
             continue
         candidate = output_dir / f"{unit_id}.mp4"
-        if candidate.exists() and not video_unit_replan_problems(unit) and reuse_existing(unit):
+        reusable = False
+        if candidate.exists() and not video_unit_replan_problems(unit):
+            try:
+                reusable = reuse_existing(unit)
+            except ArtifactManifestError:
+                # 复用判定（点名强制路线传入的 ``reuse_existing`` 恒为 False，不会走到
+                # ``artifact_is_usable``；只有整集路线的复用判定会查 Manifest）对
+                # BLOCKED 状态 fail-loud：一张已存在的成片若比对读不出来，不能让它把
+                # 整批生成打成 tool_error，而是逐 unit 记为受阻，交回去修复侧车。
+                refused.append(
+                    refused_ticket(
+                        unit_id,
+                        code=GenerationProblemCode.ARTIFACT_STATE_UNAVAILABLE,
+                        detail=f"unit {unit_id} 的产物状态不可读，跳过自动重生",
+                        action=GenerationAction.REPAIR_ARTIFACT_STATE,
+                    )
+                )
+                manifest_blocked.append(unit_id)
+                continue
+        if reusable:
             ordered_paths[idx] = candidate
             already_done.append(unit_id)
+            state = _state_for(states, unit_id)
+            builder.skip_unit(
+                unit_id,
+                artifact_key=state.artifact_key,
+                artifact_path=state.artifact_path,
+                artifact_status=state.status,
+            )
             if unit_id not in completed:
                 completed.append(unit_id)
         elif unit_id in completed:
             completed.remove(unit_id)
 
-    pending, projections = await _reference_projection_preflight(
+    # 可入队性先判：能否构造 TaskSpec 是本批目标集合的边界，不可入队的 unit 带着自己的
+    # 问题码进入准入，既不被解析、也不被静默丢弃。
+    specs, order_map, spec_refused = build_specs(units, [*already_done, *manifest_blocked])
+    buildable = {spec.resource_id for spec in specs}
+    targets = [unit for unit in units if isinstance(unit, dict) and str(unit.get("unit_id") or "") in buildable]
+    admission = await admit_reference_video_batch(
+        project_name=ctx.project_name,
         project=project,
         project_path=project_dir,
         script=script,
-        units=units,
-        skip_ids=set(already_done),
-        spec_for=spec_for,
+        script_file=script_filename,
+        units=targets,
         request_options=request_options,
-        project_name=ctx.project_name,
-        script_filename=script_filename,
+        confirmed_request_durations=confirmed_request_durations,
+        operation=operation,
+        selection=selection,
+        extra_tickets=[*refused, *spec_refused],
     )
-    if pending:
-        return DurationConfirmationPending(items=pending, projections=projections)
+    if not admission.admitted:
+        return BatchAdmissionRefused(admission)
+    projections = admission.projections()
 
-    specs, order_map = build_specs(units, already_done, log)
     for spec in specs:
-        spec.payload = {**(spec.payload or {}), "reference_request_options": request_options.to_payload()}
+        unit_options = request_options_for_unit(request_options, spec.resource_id, confirmed_request_durations)
+        spec.payload = {**(spec.payload or {}), "reference_request_options": unit_options.to_payload()}
     if specs:
-        failures = await _submit_with_checkpoint(
+        successes, failures = await _submit_with_checkpoint(
             project_name=ctx.project_name,
             project_dir=project_dir,
             specs=specs,
@@ -874,24 +859,19 @@ async def _generate_reference_units(
             save_fn=lambda: (
                 None if ckpt_path is None else _save_checkpoint_at(ckpt_path, completed, started_at, episode=episode)
             ),
-            log=log,
         )
-        if failures:
-            raise RuntimeError(f"{len(failures)} 个 unit 生成失败")
+        record_batch_outcomes(
+            builder,
+            successes=successes,
+            failures=failures,
+            states=states,
+            resolver=resolver,
+            fallback_path=_reference_fallback_relpath,
+        )
 
     final = [p for p in ordered_paths if p is not None]
-    if not final:
-        # 批量路径保留「坏 unit 跳过、有效 sibling 继续」；若整批唯一结果是发声准入阻塞，
-        # 则把首个结构化原因还给调用方，避免降级成无法指导修复的通用空批错误。
-        for unit in units:
-            try:
-                spec_for(unit)
-            except SpeechAdmissionError:
-                raise
-            except (TypeError, ValueError):
-                continue
-        raise RuntimeError("没有生成任何 video_unit")
-    if ckpt_path is not None:
+    # 全部成功才清理批次进度：有失败时保留 checkpoint 供 resume 续传。
+    if ckpt_path is not None and not builder.has_failures:
         _clear_checkpoint_at(ckpt_path)
     return ReferenceGenerationComplete(paths=final, projections=projections)
 
@@ -903,7 +883,9 @@ async def _run_reference_episode(
     script_filename: str,
     resume: bool,
     request_options: ReferenceRequestOptions,
+    confirmed_request_durations: Mapping[str, int],
     log: list[str],
+    operation: str,
 ) -> dict[str, Any]:
     """Run reference_video-mode generation and format the tool response.
 
@@ -911,7 +893,14 @@ async def _run_reference_episode(
     when ``_resolve_reference_route`` reports the episode branch; this captures
     the shared tail (resolve episode → generate units → header + log).
     """
-    episode = ProjectManager.resolve_episode_from_script(script, script_filename)
+    project = ctx.pm.load_project(ctx.project_name)
+    episode = resolve_artifact_episode(
+        project=project,
+        script=script,
+        script_filename=script_filename,
+    )
+    if episode is None:
+        episode = ProjectManager.resolve_episode_from_script(script, script_filename)
     units = script.get("video_units")
     if "video_units" in script and not isinstance(units, list):
         # 路线闸门只问键在不在、不问值的类型，容器校验落在这里：不拦的话脏值（导入 / 外部编辑
@@ -919,93 +908,81 @@ async def _run_reference_episode(
         raise ValueError(f"第 {episode} 集 video_units 必须是数组，当前为 {type(units).__name__}：{script_filename}")
     if not units:
         raise ValueError(f"第 {episode} 集 video_units 为空：{script_filename}")
-    project = ctx.pm.load_project(ctx.project_name)
+    units, malformed = screen_script_entries(units, requested_ids=None)
+    currency = active_artifact_currency_resolver(ctx.project_path, project)
+    versions = VersionManager(ctx.project_path)
+    states = video_target_states(units, "unit_id", episode=episode, resolver=currency)
+    builder = GenerationResultBuilder(operation, GenerationSelectionMode.MISSING_ONLY)
     result = await _generate_reference_units(
         ctx=ctx,
         units=units,
         episode=episode,
         resume=resume,
-        log=log,
+        builder=builder,
+        states=states,
+        resolver=currency,
         checkpoint_path=_episode_checkpoint_path(ctx.project_path, episode),
-        build_specs=lambda u, skip, lg: _build_reference_specs(
-            units=u, script_filename=script_filename, skip_ids=skip, log=lg
-        ),
-        spec_for=lambda u: _reference_unit_spec(u, script_filename),
+        build_specs=lambda u, skip: _build_reference_specs(units=u, script_filename=script_filename, skip_ids=skip),
         project=project,
         script=script,
         script_filename=script_filename,
         request_options=request_options,
-        reuse_existing=lambda unit: (
-            get_generated_assets(unit).get("video_clip") == _reference_fallback_relpath(str(unit.get("unit_id") or ""))
+        confirmed_request_durations=confirmed_request_durations,
+        operation=operation,
+        selection=GenerationSelectionMode.MISSING_ONLY,
+        extra_tickets=malformed,
+        reuse_existing=lambda unit: _batch_video_is_reusable(
+            currency=currency,
+            versions=versions,
+            episode=episode,
+            resource_type="reference_videos",
+            resource_id=str(unit.get("unit_id") or ""),
+            artifact_path=get_generated_assets(unit).get("video_clip"),
         ),
     )
-    if isinstance(result, DurationConfirmationPending):
-        return _duration_confirmation_response(result, log)
-    header = f"第 {episode} 集参考视频生成完成，共 {len(result.paths)} 个 unit"
-    return {
-        "content": [{"type": "text", "text": "\n".join([header, *log])}],
-        "request_projections": result.projections,
-    }
+    if isinstance(result, BatchAdmissionRefused):
+        return _batch_admission_response(result, log, builder, states)
+    batch = builder.build()
+    return generation_result_response(
+        batch,
+        log,
+        request_projections=result.projections,
+        **_sole_speech_admission(batch),
+    )
 
 
-def _select_reference_units(script: dict[str, Any], unit_ids: list[str], log: list[str]) -> list[dict[str, Any]]:
-    """按 unit_id 从 ``video_units`` 点名取 unit，重复 ID 只取一次。"""
+def _select_reference_units(
+    script: dict[str, Any], unit_ids: list[str]
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """按 unit_id 从 ``video_units`` 点名取 unit。
+
+    返回 ``(selected, unmatched_ids, duplicated_ids)``——不存在的 ID 由调用方作为 blocked
+    逐项报告，不在此静默丢弃，也不因此中断其余 unit；点到的 ID 在剧本里有多份时无从判定
+    要做哪一条，它不进目标集合、交调用方拒收整批，而不是默默拿第一份去入队计费。
+    """
     indexed = script.get("video_units")
     by_id: dict[str, dict[str, Any]] = {}
+    duplicated: set[str] = set()
     if isinstance(indexed, list):
         for unit in indexed:
             if isinstance(unit, dict) and isinstance(unit.get("unit_id"), str) and unit["unit_id"]:
-                by_id.setdefault(unit["unit_id"], unit)
+                if unit["unit_id"] in by_id:
+                    duplicated.add(unit["unit_id"])
+                    continue
+                by_id[unit["unit_id"]] = unit
 
     selected: list[dict[str, Any]] = []
-    for unit_id in dict.fromkeys(unit_ids):
+    unmatched: list[str] = []
+    named = list(dict.fromkeys(unit_ids))
+    for unit_id in named:
+        if unit_id in duplicated:
+            continue
         unit = by_id.get(unit_id)
         if unit is None:
-            log.append(f"⚠️  unit {unit_id} 不在 video_units 中，跳过")
+            unmatched.append(unit_id)
             continue
         selected.append(unit)
-    if not selected:
-        known = "、".join(by_id) if by_id else "（video_units 为空）"
-        raise ValueError(f"没有匹配到任何 unit：{', '.join(unit_ids)}；现有 {known}")
-    return selected
-
-
-def _assert_reference_units_generatable(units: list[dict[str, Any]], script_filename: str) -> None:
-    """点名的 unit 逐个当场校验可入队性，不合法即抛错。
-
-    批量路径对坏 unit 是「跳过并告警」——一个坏 unit 不该中断整批；点名重新生成没有
-    批次可保全，沿用跳过会让调用以「没有生成任何 video_unit」收场，智能体转述不出原因。
-    校验走 ``_reference_unit_spec``，与真正入队时同一份构造，不另立判据。
-    """
-    for unit in units:
-        try:
-            _reference_unit_spec(unit, script_filename)
-        except SpeechAdmissionError:
-            raise
-        except ValueError as exc:
-            raise ValueError(f"unit {unit.get('unit_id')} 无法生成：{exc}") from exc
-
-
-async def _assert_no_active_tasks(ctx: ToolContext, script_filename: str, units: list[dict[str, Any]]) -> None:
-    """点名重做前探测同 unit 是否已有在途任务：命中即拒绝，不新建任务也不静默沿用在途任务。
-
-    点名即强制（见 ``_run_reference_units`` docstring），但强制不等于抢占——在途任务
-    没有可抢占的中间产物，直接入队只会被 ``enqueue`` 的去重悄悄折回既有任务，智能体读到
-    一次"已提交"却并未真的重做。整批拒绝而非部分入队，避免一部分 unit 已建任务、一部分
-    被拒的不一致状态。只作用于点名路径；常规批量生成（``_run_reference_episode``）
-    仍走 ``GenerationQueue.enqueue_task`` 的既有入队去重。
-    """
-    unit_ids = [str(u["unit_id"]) for u in units]
-    active = await get_active_tasks_for_resources(
-        project_name=ctx.project_name,
-        task_type="reference_video",
-        resource_ids=unit_ids,
-        script_file=script_filename,
-    )
-    if not active:
-        return
-    details = "、".join(f"{t['resource_id']}（状态：{t['status']}）" for t in active)
-    raise ValueError(f"以下 unit 已有在途任务，请等待其完成后再重做：{details}")
+    return selected, unmatched, [unit_id for unit_id in named if unit_id in duplicated]
 
 
 async def _run_reference_units(
@@ -1014,48 +991,77 @@ async def _run_reference_units(
     script_filename: str,
     unit_ids: list[str],
     request_options: ReferenceRequestOptions,
+    confirmed_request_durations: Mapping[str, int],
     log: list[str],
+    operation: str,
 ) -> dict[str, Any]:
     """对点名的参考生视频 unit 强制重新生成成片。"""
     project = ctx.pm.load_project(ctx.project_name)
     script = ctx.pm.load_script(ctx.project_name, script_filename)
-    episode = ProjectManager.resolve_episode_from_script(script, script_filename)
+    episode = resolve_artifact_episode(
+        project=project,
+        script=script,
+        script_filename=script_filename,
+    )
+    if episode is None:
+        episode = ProjectManager.resolve_episode_from_script(script, script_filename)
 
-    selected = _select_reference_units(script, unit_ids, log)
-    # 结构校验先于在途任务探测：结构不合法的 unit 等在途任务跑完也依然生成不了，
-    # 先报「请等待」会把一个死结说成暂时性阻塞。顺带省掉一次注定要失败的库查询。
-    _assert_reference_units_generatable(selected, script_filename)
-    await _assert_no_active_tasks(ctx, script_filename, selected)
-    log.append(f"重新生成 {len(selected)} 个 unit（已有成片一律覆盖）：{', '.join(u['unit_id'] for u in selected)}")
+    selected, unmatched, duplicated = _select_reference_units(script, unit_ids)
+    if selected:
+        log.append(f"重新生成 {len(selected)} 个 unit（已有成片一律覆盖）：{', '.join(u['unit_id'] for u in selected)}")
+
+    currency = active_artifact_currency_resolver(ctx.project_path, project)
+    states = video_target_states(selected, "unit_id", episode=episode, resolver=currency)
+    builder = GenerationResultBuilder(operation, GenerationSelectionMode.EXPLICIT)
+    unmatched_tickets = [
+        refused_ticket(
+            unit_id,
+            code=GenerationProblemCode.UNIT_NOT_FOUND,
+            detail=f"unit {unit_id} 不在 video_units 中",
+            action=GenerationAction.FIX_INPUT,
+        )
+        for unit_id in unmatched
+    ]
+    unmatched_tickets += [
+        refused_ticket(
+            unit_id,
+            code=GenerationProblemCode.UNIT_REQUEST_INVALID,
+            detail=f"unit {unit_id} 在剧本中重复出现",
+            action=GenerationAction.FIX_INPUT,
+        )
+        for unit_id in duplicated
+    ]
 
     result = await _generate_reference_units(
         ctx=ctx,
         units=selected,
         episode=episode,
         resume=False,
-        log=log,
+        builder=builder,
+        states=states,
+        resolver=currency,
         checkpoint_path=None,
-        build_specs=lambda u, skip, lg: _build_reference_specs(
-            units=u,
-            script_filename=script_filename,
-            skip_ids=skip,
-            log=lg,
-        ),
-        spec_for=lambda u: _reference_unit_spec(u, script_filename),
+        build_specs=lambda u, skip: _build_reference_specs(units=u, script_filename=script_filename, skip_ids=skip),
         project=project,
         script=script,
         script_filename=script_filename,
         request_options=request_options,
+        confirmed_request_durations=confirmed_request_durations,
+        operation=operation,
+        selection=GenerationSelectionMode.EXPLICIT,
+        extra_tickets=unmatched_tickets,
         # 点名即强制：磁盘上的同名成片一律不复用。
         reuse_existing=lambda _u: False,
     )
-    if isinstance(result, DurationConfirmationPending):
-        return _duration_confirmation_response(result, log)
-    header = f"参考生视频重新生成完成，共 {len(result.paths)} 个 unit"
-    return {
-        "content": [{"type": "text", "text": "\n".join([header, *log])}],
-        "request_projections": result.projections,
-    }
+    if isinstance(result, BatchAdmissionRefused):
+        return _batch_admission_response(result, log, builder, states)
+    batch = builder.build()
+    return generation_result_response(
+        batch,
+        log,
+        request_projections=result.projections,
+        **_sole_speech_admission(batch),
+    )
 
 
 def generate_video_episode_tool(ctx: ToolContext):
@@ -1072,8 +1078,10 @@ def generate_video_episode_tool(ctx: ToolContext):
                 },
                 "resume": {"type": "boolean", "description": "是否从上次中断处继续"},
                 "confirmed_request_duration_seconds": _CONFIRMED_REQUEST_DURATION_SCHEMA_PROPERTY,
+                "confirmed_request_durations": _CONFIRMED_REQUEST_DURATIONS_SCHEMA_PROPERTY,
+                "narration_delivery": _NARRATION_DELIVERY_SCHEMA_PROPERTY,
             },
-            "required": ["script"],
+            "required": ["script", "narration_delivery"],
         },
     )
     async def _handler(args: dict[str, Any]) -> dict[str, Any]:
@@ -1081,7 +1089,8 @@ def generate_video_episode_tool(ctx: ToolContext):
         try:
             script_filename = validate_script_filename(args["script"])
             resume = bool(args.get("resume"))
-            request_options = _batch_reference_request_options(args)
+            request_options = _reference_request_options(args)
+            confirmed_request_durations = _confirmed_request_durations(args)
 
             project_dir = ctx.project_path
             script = ctx.pm.load_script(ctx.project_name, script_filename)
@@ -1094,13 +1103,26 @@ def generate_video_episode_tool(ctx: ToolContext):
                     script_filename=script_filename,
                     resume=resume,
                     request_options=request_options,
+                    confirmed_request_durations=confirmed_request_durations,
                     log=log,
+                    operation=_EPISODE_OPERATION,
                 )
-            episode = ProjectManager.resolve_episode_from_script(script, script_filename)
             items, id_field, _chars, _scenes, _props = get_storyboard_items(script)
+            # 骨架种类取剧本实际形态（与路线闸门同一份判别），族内历史形态才不会被按内容模式
+            # 反推的种类误判成解析失败。
+            skeleton_kind = resolve_script_kind(script)
+            items, screen_refused = _screen_storyboard_items(items, id_field, requested_ids=None)
             project = ctx.pm.load_project(ctx.project_name)
+            episode = (
+                resolve_artifact_episode(
+                    project=project,
+                    script=script,
+                    script_filename=script_filename,
+                )
+                or 1
+            )
             content_mode = resolve_content_mode(script, project)
-            if not items:
+            if not items and not screen_refused:
                 raise ValueError(f"第 {episode} 集剧本为空：{script_filename}")
 
             ckpt_path = _episode_checkpoint_path(project_dir, episode)
@@ -1114,25 +1136,86 @@ def generate_video_episode_tool(ctx: ToolContext):
 
             videos_dir = project_dir / "videos"
             videos_dir.mkdir(parents=True, exist_ok=True)
-            ordered_paths, already_done, completed = _scan_completed_items(items, id_field, completed, videos_dir)
-            voice_characters = await _resolve_voice_context(ctx, content_mode)
-            specs, order_map = _build_video_specs(
+            currency = active_artifact_currency_resolver(project_dir, project)
+            ordered_paths, already_done, completed = _scan_completed_items(
+                items,
+                id_field,
+                completed,
+                videos_dir,
+                episode=episode,
+                resolver=currency,
+            )
+            states = video_target_states(items, id_field, episode=episode, resolver=currency)
+            # 整集生成始终复用仍可用的旧片段（含 stale），从不强制重生——所以
+            # 无论是否 resume，选择模式如实报告为 missing-only；点名重做走
+            # generate_video_scene / generate_selected_videos。checkpoint 的
+            # completed_scenes 只认得本批次（或此前 resume）提交过的 ID，非
+            # resume 调用永远从空表起步；不并入当前 currency 观测到的
+            # current/stale，就会把整集当作缺失重新生成一遍。
+            already_done = [
+                *already_done,
+                *_currency_reusable_ids(
+                    states, already_done, manifest_active=currency is not None, project_dir=project_dir
+                ),
+            ]
+            builder = GenerationResultBuilder(_EPISODE_OPERATION, GenerationSelectionMode.MISSING_ONLY)
+            for done_id in already_done:
+                state = _state_for(states, str(done_id))
+                builder.skip(state)
+
+            # currency 之外的第三态：Manifest 读不出该片段的产物状态（BLOCKED），既不能
+            # 判定为可复用（进 already_done）也不能安全当作缺失去入队——不可读不等于没有，
+            # 花钱重生可能覆盖一份实际仍然可用的片段。generate_video_all 走
+            # select_generation_targets 已经把这一态折进 selection.unavailable，这里是
+            # 同一场判定手写的另一条腿，必须同步处理。
+            already_done_set = set(already_done)
+            blocked_states = [
+                state
+                for unit_id, state in states.items()
+                if unit_id not in already_done_set and state.status == ArtifactStatus.BLOCKED
+            ]
+            blocked_ids = [state.unit_id for state in blocked_states]
+            refused = artifact_state_tickets(blocked_states)
+            refused.extend(screen_refused)
+
+            voice_characters = await resolve_voice_context(project, content_mode)
+            specs, order_map, spec_refused = build_storyboard_video_specs(
                 items=items,
                 id_field=id_field,
                 content_mode=content_mode,
+                skeleton_kind=skeleton_kind,
                 script_filename=script_filename,
                 project_dir=project_dir,
-                skip_ids=already_done,
-                log=log,
+                project=project,
+                episode=episode,
+                resolver=currency,
+                skip_ids=[*already_done, *blocked_ids],
                 voice_characters=voice_characters,
             )
+            refused.extend(spec_refused)
 
-            if not specs and not any(ordered_paths):
+            if not specs and not refused and not builder.recorded_ids and not any(ordered_paths):
                 raise RuntimeError("没有可生成的视频片段")
 
+            admission = await _admit_storyboard_specs(
+                ctx=ctx,
+                project=project,
+                script=script,
+                script_filename=script_filename,
+                items=items,
+                id_field=id_field,
+                specs=specs,
+                request_options=request_options,
+                confirmed_request_durations=confirmed_request_durations,
+                operation=_EPISODE_OPERATION,
+                selection=GenerationSelectionMode.MISSING_ONLY,
+                extra_tickets=refused,
+            )
+            if not admission.admitted:
+                return _batch_admission_response(BatchAdmissionRefused(admission), log, builder, states)
+
             if specs:
-                await _assert_audio_switch_for_storyboard(ctx)
-                failures = await _submit_with_checkpoint(
+                successes, failures = await _submit_with_checkpoint(
                     project_name=ctx.project_name,
                     project_dir=project_dir,
                     specs=specs,
@@ -1141,21 +1224,26 @@ def generate_video_episode_tool(ctx: ToolContext):
                     completed=completed,
                     fallback_relpath=_scene_fallback_relpath,
                     save_fn=lambda: _save_checkpoint_at(ckpt_path, completed, started_at, episode=episode),
-                    log=log,
                 )
-                if failures:
-                    raise RuntimeError(f"{len(failures)} 个视频生成失败（使用 resume=true 续传）")
+                record_batch_outcomes(
+                    builder,
+                    successes=successes,
+                    failures=failures,
+                    states=states,
+                    resolver=currency,
+                    fallback_path=_scene_fallback_relpath,
+                )
 
-            scene_videos = [p for p in ordered_paths if p is not None]
-            _clear_checkpoint_at(ckpt_path)
-            header = f"第 {episode} 集视频生成完成，共 {len(scene_videos)} 个片段"
-            return {"content": [{"type": "text", "text": "\n".join([header, *log])}]}
-        except ReferenceProjectionBlocked as exc:
-            return _reference_projection_error("generate_video_episode", exc, log)
+            # checkpoint 只在整批无失败时清除，否则 resume=true 仍能接上断点。
+            if not builder.has_failures:
+                _clear_checkpoint_at(ckpt_path)
+            return generation_result_response(builder.build(), log)
+        except BatchEnqueueAborted as exc:
+            return _enqueue_aborted_error(_EPISODE_OPERATION, exc, log)
         except SpeechAdmissionError as exc:
-            return _speech_admission_error("generate_video_episode", exc, log)
+            return _speech_admission_error(_EPISODE_OPERATION, exc, log)
         except Exception as exc:  # noqa: BLE001
-            return tool_error("generate_video_episode", exc, log)
+            return tool_error(_EPISODE_OPERATION, exc, log)
 
     return _handler
 
@@ -1176,9 +1264,10 @@ def generate_video_scene_tool(ctx: ToolContext):
                     "description": "场景或片段 ID；reference_video 项目传 video_unit 的 unit_id（如 E1U2）",
                 },
                 "confirmed_request_duration_seconds": _CONFIRMED_REQUEST_DURATION_SCHEMA_PROPERTY,
+                "confirmed_request_durations": _CONFIRMED_REQUEST_DURATIONS_SCHEMA_PROPERTY,
                 "narration_delivery": _NARRATION_DELIVERY_SCHEMA_PROPERTY,
             },
-            "required": ["script", "scene_id"],
+            "required": ["script", "scene_id", "narration_delivery"],
         },
     )
     async def _handler(args: dict[str, Any]) -> dict[str, Any]:
@@ -1187,6 +1276,7 @@ def generate_video_scene_tool(ctx: ToolContext):
             script_filename = validate_script_filename(args["script"])
             scene_id = args["scene_id"]
             request_options = _reference_request_options(args)
+            confirmed_request_durations = _confirmed_request_durations(args)
 
             project_dir = ctx.project_path
             script = ctx.pm.load_script(ctx.project_name, script_filename)
@@ -1198,82 +1288,99 @@ def generate_video_scene_tool(ctx: ToolContext):
                     script_filename=script_filename,
                     unit_ids=[scene_id],
                     request_options=request_options,
+                    confirmed_request_durations=confirmed_request_durations,
                     log=log,
+                    operation=_SCENE_OPERATION,
                 )
 
+            builder = GenerationResultBuilder(_SCENE_OPERATION, GenerationSelectionMode.EXPLICIT)
             items, id_field, _chars, _scenes, _props = get_storyboard_items(script)
+            # 骨架种类取剧本实际形态（与路线闸门同一份判别），族内历史形态才不会被按内容模式
+            # 反推的种类误判成解析失败。
+            skeleton_kind = resolve_script_kind(script)
+            items, screen_refused = _screen_storyboard_items(items, id_field, requested_ids={scene_id})
             item = next((s for s in items if s.get(id_field) == scene_id or s.get("scene_id") == scene_id), None)
             if not item:
-                raise ValueError(f"场景/片段 '{scene_id}' 不存在")
-            # 调用方可能用 ``scene_id`` 别名命中条目，但入队 / 文件名 / fallback
-            # 必须用脚本里的规范 ``id_field`` 值，否则下游 generate_video_all 和
-            # checkpoint 扫描会找不到产物。
-            item_id = str(item[id_field])
-            require_script_unit_admitted(resolve_script_kind(script), item)
-
-            storyboard_image = get_generated_assets(item).get("storyboard_image")
-            # 字段值来自磁盘剧本 JSON，不可信任：resolve_storyboard_image_ref 统一做类型检查 +
-            # 越界 / 绝对路径拒绝（与路由入队预检、执行层读盘点共用同一份），异常经外层
-            # except 转为可读的 tool_error，不再让非字符串脏数据抛未处理 TypeError。
-            storyboard_path = resolve_storyboard_image_ref(project_dir, storyboard_image)
-            if storyboard_path is None:
-                raise ValueError(f"场景/片段 '{item_id}' 没有分镜图，请先运行 generate_storyboards")
-            if not storyboard_path.is_file():
-                raise FileNotFoundError(f"分镜图不存在: {storyboard_path}")
-
+                # 筛查已经按这个名字拒过（剧本里它指向多个条目）时报筛查的结论：同一个 ID
+                # 记两遍会撞上结果契约的唯一性，用户拿到一句通用报错。
+                screened = next((ticket for ticket in screen_refused if ticket.unit_id == scene_id), None)
+                builder.block(
+                    scene_id,
+                    problem=screened.problems[0]
+                    if screened is not None and screened.problems
+                    else GenerationProblem(
+                        code=GenerationProblemCode.UNIT_NOT_FOUND,
+                        detail=f"场景/片段 '{scene_id}' 不存在",
+                        action=GenerationAction.FIX_INPUT,
+                    ),
+                )
+                return generation_result_response(builder.build(), log)
             project = ctx.pm.load_project(ctx.project_name)
-            content_mode = resolve_content_mode(script, project)
-            voice_characters = await _resolve_voice_context(ctx, content_mode)
-            prompt = _get_video_prompt(item, content_mode=content_mode, voice_characters=voice_characters)
-            # duration 是能力维度，留待执行层在 provider 解析后校验（见 ADR-0001）；
-            # 原样透传调用方显式指定的值，不在入队侧做 int() 截断式归一化（否则会把
-            # 本应被执行层拒绝的非法值静默修正）。缺省由执行层按 caps 收口默认。
-            extra_payload: dict[str, Any] = {}
-            duration = item.get("duration_seconds")
-            if duration is not None:
-                extra_payload["duration_seconds"] = duration
-            spec = TaskSpec.from_request(
-                task_type="video",
-                media_type="video",
-                resource_id=item_id,
-                prompt=prompt,
-                script_file=script_filename,
-                extra_payload=extra_payload or None,
+            episode = (
+                resolve_artifact_episode(
+                    project=project,
+                    script=script,
+                    script_filename=script_filename,
+                )
+                or 1
             )
+            currency = active_artifact_currency_resolver(project_dir, project)
+            states = video_target_states([item], id_field, episode=episode, resolver=currency)
 
-            delivery_pending = await _prepare_storyboard_delivery_specs(
+            # 发声准入与输入可用性都由 _build_video_specs 判定，点名单条与整批走同一条缝：
+            # 两处各判一次，口径就会随其中一处的改动分叉。
+            content_mode = resolve_content_mode(script, project)
+            voice_characters = await resolve_voice_context(project, content_mode)
+            specs, _order_map, refused = build_storyboard_video_specs(
+                items=[item],
+                id_field=id_field,
+                content_mode=content_mode,
+                skeleton_kind=skeleton_kind,
+                script_filename=script_filename,
+                project_dir=project_dir,
+                project=project,
+                episode=episode,
+                resolver=currency,
+                skip_ids=None,
+                voice_characters=voice_characters,
+            )
+            refused.extend(screen_refused)
+            if not specs and not refused:
+                return generation_result_response(builder.build(), log)
+
+            admission = await _admit_storyboard_specs(
                 ctx=ctx,
                 project=project,
                 script=script,
                 script_filename=script_filename,
                 items=[item],
                 id_field=id_field,
-                specs=[spec],
+                specs=specs,
                 request_options=request_options,
+                confirmed_request_durations=confirmed_request_durations,
+                operation=_SCENE_OPERATION,
+                selection=GenerationSelectionMode.EXPLICIT,
+                extra_tickets=refused,
             )
-            if delivery_pending is not None:
-                return _duration_confirmation_response(delivery_pending, log)
+            if not admission.admitted:
+                return _batch_admission_response(BatchAdmissionRefused(admission), log, builder, states)
 
-            await _assert_audio_switch_for_storyboard(ctx)
-            queued = await enqueue_and_wait(
-                project_name=ctx.project_name,
-                task_type=spec.task_type,
-                media_type=spec.media_type,
-                resource_id=spec.resource_id,
-                payload=spec.payload,
-                script_file=spec.script_file,
-                source="skill",
+            successes, failures = await batch_enqueue_and_wait(project_name=ctx.project_name, specs=specs, atomic=True)
+            record_batch_outcomes(
+                builder,
+                successes=successes,
+                failures=failures,
+                states=states,
+                resolver=currency,
+                fallback_path=_scene_fallback_relpath,
             )
-            result = queued.get("result") or {}
-            rel = result.get("file_path") or f"videos/scene_{item_id}.mp4"
-            output_path = project_dir / rel
-            return {"content": [{"type": "text", "text": f"✅ 视频已保存: {output_path}"}]}
-        except ReferenceProjectionBlocked as exc:
-            return _reference_projection_error("generate_video_scene", exc, log)
+            return generation_result_response(builder.build(), log)
+        except BatchEnqueueAborted as exc:
+            return _enqueue_aborted_error(_SCENE_OPERATION, exc, log)
         except SpeechAdmissionError as exc:
-            return _speech_admission_error("generate_video_scene", exc, log)
+            return _speech_admission_error(_SCENE_OPERATION, exc, log)
         except Exception as exc:  # noqa: BLE001
-            return tool_error("generate_video_scene", exc, log)
+            return tool_error(_SCENE_OPERATION, exc, log)
 
     return _handler
 
@@ -1290,15 +1397,18 @@ def generate_video_all_tool(ctx: ToolContext):
                     "description": "剧本文件名（如 episode_1.json），必须是纯文件名，禁止任何路径分隔符",
                 },
                 "confirmed_request_duration_seconds": _CONFIRMED_REQUEST_DURATION_SCHEMA_PROPERTY,
+                "confirmed_request_durations": _CONFIRMED_REQUEST_DURATIONS_SCHEMA_PROPERTY,
+                "narration_delivery": _NARRATION_DELIVERY_SCHEMA_PROPERTY,
             },
-            "required": ["script"],
+            "required": ["script", "narration_delivery"],
         },
     )
     async def _handler(args: dict[str, Any]) -> dict[str, Any]:
         log: list[str] = []
         try:
             script_filename = validate_script_filename(args["script"])
-            request_options = _batch_reference_request_options(args)
+            request_options = _reference_request_options(args)
+            confirmed_request_durations = _confirmed_request_durations(args)
             project_dir = ctx.project_path
             script = ctx.pm.load_script(ctx.project_name, script_filename)
 
@@ -1310,48 +1420,107 @@ def generate_video_all_tool(ctx: ToolContext):
                     script_filename=script_filename,
                     resume=False,
                     request_options=request_options,
+                    confirmed_request_durations=confirmed_request_durations,
                     log=log,
+                    operation=_ALL_OPERATION,
                 )
             items, id_field, _chars, _scenes, _props = get_storyboard_items(script)
+            # 骨架种类取剧本实际形态（与路线闸门同一份判别），族内历史形态才不会被按内容模式
+            # 反推的种类误判成解析失败。
+            skeleton_kind = resolve_script_kind(script)
+            items, screen_refused = _screen_storyboard_items(items, id_field, requested_ids=None)
             project = ctx.pm.load_project(ctx.project_name)
             content_mode = resolve_content_mode(script, project)
-            pending = [it for it in items if not get_generated_assets(it).get("video_clip")]
-            if not pending:
-                return {"content": [{"type": "text", "text": "✨ 所有场景/片段的视频都已生成"}]}
+            currency = active_artifact_currency_resolver(project_dir, project)
+            versions = VersionManager(project_dir)
+            episode = (
+                resolve_artifact_episode(
+                    project=project,
+                    script=script,
+                    script_filename=script_filename,
+                )
+                or 1
+            )
+            states = video_target_states(items, id_field, episode=episode, resolver=currency)
+            selection = select_generation_targets(
+                candidates=[state.candidate for state in states.values()],
+                requested_ids=None,
+                resolver=currency,
+                project_dir=project_dir,
+                # 一次精确匹配的手动上传与 Manifest 认定的 current/stale 同样可复用，
+                # 两条腿合起来才是「这个 ID 还缺不缺视频」。
+                reusable_override=lambda candidate: versions.selected_manual_upload_matches_current_file(
+                    "videos",
+                    candidate.unit_id,
+                    candidate.artifact_path,
+                ),
+            )
+            # 产物状态不可读的目标由准入报告（折成准入票），结果契约里不重复记录：
+            # 同一个 unit 记两次会让结果构造器 fail loud。
+            unavailable_tickets = artifact_state_tickets(selection.unavailable)
+            builder = GenerationResultBuilder.from_selection(_ALL_OPERATION, replace(selection, unavailable=()))
+            if not selection.targets and not unavailable_tickets and not screen_refused:
+                return generation_result_response(builder.build(), log)
 
-            voice_characters = await _resolve_voice_context(ctx, content_mode)
-            specs, _order_map = _build_video_specs(
+            # 与 ``_video_target_states`` 用同一套 ID 回退规则：条目若缺 ``id_field``
+            # 但带 ``scene_id``/``segment_id``，selection 已按回退 ID 记为 target，
+            # 这里若只认 ``id_field`` 会把它筛没——进了 requested 却永远不入队。
+            target_id_set = set(selection.target_ids)
+            pending = [item for item in items if str(storyboard_item_id(item, id_field) or "") in target_id_set]
+            voice_characters = await resolve_voice_context(project, content_mode)
+            specs, _order_map, refused = build_storyboard_video_specs(
                 items=pending,
                 id_field=id_field,
                 content_mode=content_mode,
+                skeleton_kind=skeleton_kind,
                 script_filename=script_filename,
                 project_dir=project_dir,
+                project=project,
+                episode=episode,
+                resolver=currency,
                 skip_ids=None,
-                log=log,
                 voice_characters=voice_characters,
             )
-            if not specs:
-                return {"content": [{"type": "text", "text": "\n".join([*log, "⚠️  没有任何可生成的视频任务"])}]}
+            # 产物状态不可读的场景被选目标环节排除在 targets 之外，但它属于这次请求：
+            # 不带进准入，同批健康的场景会照常入队并计费，剩下这一个被无声略过。
+            refused.extend(unavailable_tickets)
+            refused.extend(screen_refused)
+            if not specs and not refused:
+                return generation_result_response(builder.build(), log)
 
-            await _assert_audio_switch_for_storyboard(ctx)
-            successes, failures = await batch_enqueue_and_wait(project_name=ctx.project_name, specs=specs)
-            details: list[str] = []
-            for br in successes:
-                rel = (br.result or {}).get("file_path") or f"videos/scene_{br.resource_id}.mp4"
-                details.append(f"  ✓ {br.resource_id} → {rel}")
-            for br in failures:
-                details.append(f"  ✗ {br.resource_id}: {br.error}")
-            header = f"generate_video_all summary: {len(successes)} succeeded, {len(failures)} failed"
-            return {
-                "content": [{"type": "text", "text": "\n".join([header, *log, *details])}],
-                "is_error": bool(failures),
-            }
-        except ReferenceProjectionBlocked as exc:
-            return _reference_projection_error("generate_video_all", exc, log)
+            admission = await _admit_storyboard_specs(
+                ctx=ctx,
+                project=project,
+                script=script,
+                script_filename=script_filename,
+                items=pending,
+                id_field=id_field,
+                specs=specs,
+                request_options=request_options,
+                confirmed_request_durations=confirmed_request_durations,
+                operation=_ALL_OPERATION,
+                selection=GenerationSelectionMode.MISSING_ONLY,
+                extra_tickets=refused,
+            )
+            if not admission.admitted:
+                return _batch_admission_response(BatchAdmissionRefused(admission), log, builder, states)
+
+            successes, failures = await batch_enqueue_and_wait(project_name=ctx.project_name, specs=specs, atomic=True)
+            record_batch_outcomes(
+                builder,
+                successes=successes,
+                failures=failures,
+                states=states,
+                resolver=currency,
+                fallback_path=_scene_fallback_relpath,
+            )
+            return generation_result_response(builder.build(), log)
+        except BatchEnqueueAborted as exc:
+            return _enqueue_aborted_error(_ALL_OPERATION, exc, log)
         except SpeechAdmissionError as exc:
-            return _speech_admission_error("generate_video_all", exc, log)
+            return _speech_admission_error(_ALL_OPERATION, exc, log)
         except Exception as exc:  # noqa: BLE001
-            return tool_error("generate_video_all", exc, log)
+            return tool_error(_ALL_OPERATION, exc, log)
 
     return _handler
 
@@ -1360,7 +1529,8 @@ def generate_video_selected_tool(ctx: ToolContext):
     @tool(
         "generate_video_selected",
         "生成指定多个场景的视频。storyboard 项目用按 scene_ids 哈希的独立 checkpoint，支持 resume 续传。"
-        "reference_video 项目传 unit_id 列表即对这些 unit 重新生成（覆盖已有成片），不落 checkpoint、不支持 resume。",
+        "reference_video 项目传 unit_id 列表即对这些 unit 重新生成（覆盖已有成片），"
+        "不落批次进度 checkpoint、忽略此处 resume 参数；已入队任务的 provider 提交恢复由队列独立处理。",
         {
             "type": "object",
             "properties": {
@@ -1378,8 +1548,10 @@ def generate_video_selected_tool(ctx: ToolContext):
                     "description": "是否从上次中断处继续；reference_video 项目的点名重新生成会忽略此参数",
                 },
                 "confirmed_request_duration_seconds": _CONFIRMED_REQUEST_DURATION_SCHEMA_PROPERTY,
+                "confirmed_request_durations": _CONFIRMED_REQUEST_DURATIONS_SCHEMA_PROPERTY,
+                "narration_delivery": _NARRATION_DELIVERY_SCHEMA_PROPERTY,
             },
-            "required": ["script", "scene_ids"],
+            "required": ["script", "scene_ids", "narration_delivery"],
         },
     )
     async def _handler(args: dict[str, Any]) -> dict[str, Any]:
@@ -1388,9 +1560,10 @@ def generate_video_selected_tool(ctx: ToolContext):
             script_filename = validate_script_filename(args["script"])
             # 去重以避免同一 ID 重复入队；保留首次出现顺序便于人读日志，
             # checkpoint hash 再单独排序（见下方 ``canonical_scene_ids``）。
-            scene_ids: list[str] = list(dict.fromkeys(args["scene_ids"]))
+            scene_ids: list[str] = normalize_requested_ids(args["scene_ids"], field="scene_ids") or []
             resume = bool(args.get("resume"))
-            request_options = _batch_reference_request_options(args)
+            request_options = _reference_request_options(args)
+            confirmed_request_durations = _confirmed_request_durations(args)
 
             project_dir = ctx.project_path
             script = ctx.pm.load_script(ctx.project_name, script_filename)
@@ -1406,27 +1579,55 @@ def generate_video_selected_tool(ctx: ToolContext):
                     script_filename=script_filename,
                     unit_ids=scene_ids,
                     request_options=request_options,
+                    confirmed_request_durations=confirmed_request_durations,
                     log=log,
+                    operation=_SELECTED_OPERATION,
                 )
 
             items, id_field, _chars, _scenes, _props = get_storyboard_items(script)
+            # 骨架种类取剧本实际形态（与路线闸门同一份判别），族内历史形态才不会被按内容模式
+            # 反推的种类误判成解析失败。
+            skeleton_kind = resolve_script_kind(script)
+            items, screen_refused = _screen_storyboard_items(items, id_field, requested_ids=set(scene_ids))
             project = ctx.pm.load_project(ctx.project_name)
             content_mode = resolve_content_mode(script, project)
+            episode = (
+                resolve_artifact_episode(
+                    project=project,
+                    script=script,
+                    script_filename=script_filename,
+                )
+                or 1
+            )
 
             items_by_id: dict[str, dict[str, Any]] = {}
             for item in items:
-                items_by_id[item.get(id_field, "")] = item
-                if "scene_id" in item:
-                    items_by_id[item["scene_id"]] = item
+                # 按同一份「能寻址到它的写法」建索引：直接拿原值当键，脏剧本里的 list / dict
+                # 别名会抛 TypeError，逐目标的结论就塌成一句通用报错。
+                for alias in _storyboard_item_aliases(item, id_field):
+                    items_by_id[alias] = item
 
+            builder = GenerationResultBuilder(_SELECTED_OPERATION, GenerationSelectionMode.EXPLICIT)
             selected: list[dict[str, Any]] = []
+            refused: list[UnitAdmissionTicket] = []
             seen_canonical: set[str] = set()
             # ``items_by_id`` 同时按 ``id_field`` 与 ``scene_id`` 索引同一个 item，
             # 调用方若把两个值都列入 ``scene_ids`` 会让同一场景重复入队——必须按
             # 规范 ``id_field`` 再去一次重。
+            screened_ids = {ticket.unit_id for ticket in screen_refused}
             for sid in scene_ids:
+                if sid in screened_ids:
+                    # 筛查已经按这个名字记过一条结论，重复记名会撞上结果契约的唯一性。
+                    continue
                 if sid not in items_by_id:
-                    log.append(f"⚠️  场景/片段 '{sid}' 不存在，跳过")
+                    refused.append(
+                        refused_ticket(
+                            sid,
+                            code=GenerationProblemCode.UNIT_NOT_FOUND,
+                            detail=f"场景/片段 '{sid}' 不存在",
+                            action=GenerationAction.FIX_INPUT,
+                        )
+                    )
                     continue
                 item = items_by_id[sid]
                 canonical = str(item.get(id_field, ""))
@@ -1434,8 +1635,8 @@ def generate_video_selected_tool(ctx: ToolContext):
                     continue
                 seen_canonical.add(canonical)
                 selected.append(item)
-            if not selected:
-                raise ValueError("没有找到任何有效的场景/片段")
+            if not selected and not refused and not screen_refused:
+                return generation_result_response(builder.build(), log)
 
             # checkpoint hash 用 ``selected`` 解析出的规范 ID 集合，让同一批
             # 场景无论用别名 ``scene_id`` 还是规范 ``id_field`` 调用都落到同一
@@ -1454,28 +1655,55 @@ def generate_video_selected_tool(ctx: ToolContext):
 
             videos_dir = project_dir / "videos"
             videos_dir.mkdir(parents=True, exist_ok=True)
-            ordered_paths, already_done, completed = _scan_completed_items(selected, id_field, completed, videos_dir)
-            voice_characters = await _resolve_voice_context(ctx, content_mode)
-            specs, order_map = _build_video_specs(
+            currency = active_artifact_currency_resolver(project_dir, project)
+            ordered_paths, already_done, completed = _scan_completed_items(
+                selected,
+                id_field,
+                completed,
+                videos_dir,
+                episode=episode,
+                resolver=currency,
+            )
+            states = video_target_states(selected, id_field, episode=episode, resolver=currency)
+            for done_id in already_done:
+                builder.skip(_state_for(states, str(done_id)))
+
+            voice_characters = await resolve_voice_context(project, content_mode)
+            specs, order_map, spec_refused = build_storyboard_video_specs(
                 items=selected,
                 id_field=id_field,
                 content_mode=content_mode,
+                skeleton_kind=skeleton_kind,
                 script_filename=script_filename,
                 project_dir=project_dir,
+                project=project,
+                episode=episode,
+                resolver=currency,
                 skip_ids=already_done,
-                log=log,
                 voice_characters=voice_characters,
             )
+            refused.extend(spec_refused)
+            refused.extend(screen_refused)
 
-            # ``_build_video_specs`` 可能把所有 selected 都过滤掉（缺分镜图 /
-            # video_prompt 无效），此时如果 ``ordered_paths`` 也没有已生成项就是
-            # "什么也没做"，必须抛错，否则下游会把 "完成：0 个" 当成功推进流程。
-            if not specs and not any(ordered_paths):
-                raise RuntimeError("没有任何可生成的视频任务（全部 selected 都被跳过）")
+            admission = await _admit_storyboard_specs(
+                ctx=ctx,
+                project=project,
+                script=script,
+                script_filename=script_filename,
+                items=selected,
+                id_field=id_field,
+                specs=specs,
+                request_options=request_options,
+                confirmed_request_durations=confirmed_request_durations,
+                operation=_SELECTED_OPERATION,
+                selection=GenerationSelectionMode.EXPLICIT,
+                extra_tickets=refused,
+            )
+            if not admission.admitted:
+                return _batch_admission_response(BatchAdmissionRefused(admission), log, builder, states)
 
             if specs:
-                await _assert_audio_switch_for_storyboard(ctx)
-                failures = await _submit_with_checkpoint(
+                successes, failures = await _submit_with_checkpoint(
                     project_name=ctx.project_name,
                     project_dir=project_dir,
                     specs=specs,
@@ -1484,21 +1712,26 @@ def generate_video_selected_tool(ctx: ToolContext):
                     completed=completed,
                     fallback_relpath=_scene_fallback_relpath,
                     save_fn=lambda: _save_checkpoint_at(ckpt_path, completed, started_at, scene_ids=scene_ids),
-                    log=log,
                 )
-                if failures:
-                    raise RuntimeError(f"{len(failures)} 个视频生成失败（使用 resume=true 续传）")
+                record_batch_outcomes(
+                    builder,
+                    successes=successes,
+                    failures=failures,
+                    states=states,
+                    resolver=currency,
+                    fallback_path=_scene_fallback_relpath,
+                )
 
-            final_results = [p for p in ordered_paths if p is not None]
-            _clear_checkpoint_at(ckpt_path)
-            header = f"generate_video_selected 完成：{len(final_results)} 个"
-            return {"content": [{"type": "text", "text": "\n".join([header, *log])}]}
-        except ReferenceProjectionBlocked as exc:
-            return _reference_projection_error("generate_video_selected", exc, log)
+            # checkpoint 只在整批无失败时清除，否则 resume=true 仍能接上断点。
+            if not builder.has_failures:
+                _clear_checkpoint_at(ckpt_path)
+            return generation_result_response(builder.build(), log)
+        except BatchEnqueueAborted as exc:
+            return _enqueue_aborted_error(_SELECTED_OPERATION, exc, log)
         except SpeechAdmissionError as exc:
-            return _speech_admission_error("generate_video_selected", exc, log)
+            return _speech_admission_error(_SELECTED_OPERATION, exc, log)
         except Exception as exc:  # noqa: BLE001
-            return tool_error("generate_video_selected", exc, log)
+            return tool_error(_SELECTED_OPERATION, exc, log)
 
     return _handler
 

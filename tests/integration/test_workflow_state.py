@@ -6,15 +6,25 @@ from pathlib import Path
 import pytest
 
 import lib.script_review as script_review
+from lib.artifact_activation import register_current_artifact
+from lib.artifact_manifest import ArtifactKey, ProjectArtifactManifestAdapter
 from lib.asset_inventory import complete_asset_inventory
 from lib.episode_ledger import SOURCE_FINGERPRINTS_KEY, compute_source_fingerprints, discover_sources
 from lib.json_io import atomic_write_json
 from lib.project_manager import ProjectManager
+from lib.project_migrations.v7_to_v8_artifact_manifest import migrate_v7_to_v8
 from lib.source_revision import SourceScope, compute_source_revision
+from lib.version_manager import MANUAL_UPLOAD_VERSION_SOURCE, VersionManager
 from lib.workflow_state import WorkflowStateService
 
 
-def _make_project(tmp_path: Path, mode: str, *, generation_mode: str = "storyboard") -> tuple[ProjectManager, Path]:
+def _make_project(
+    tmp_path: Path,
+    mode: str,
+    *,
+    generation_mode: str = "storyboard",
+    activated: bool = False,
+) -> tuple[ProjectManager, Path]:
     pm = ProjectManager(tmp_path / "projects")
     pm.create_project("demo")
     extras = {"generation_mode": generation_mode, "grid_storyboard": False}
@@ -22,7 +32,10 @@ def _make_project(tmp_path: Path, mode: str, *, generation_mode: str = "storyboa
         pm.create_project_metadata("demo", "Demo", "", mode, extras=extras, target_duration=30)
     else:
         pm.create_project_metadata("demo", "Demo", "", mode, extras=extras)
-    return pm, pm.get_project_path("demo")
+    project_path = pm.get_project_path("demo")
+    if not activated:
+        pm.update_project("demo", lambda project: project.update(schema_version=7))
+    return pm, project_path
 
 
 def _write_source_and_complete(pm: ProjectManager, project_path: Path, text: str = "原文") -> str:
@@ -264,7 +277,7 @@ def test_unsafe_source_returns_blocker_instead_of_skipping_or_raising(tmp_path: 
 
 
 @pytest.mark.integration
-def test_narration_progresses_through_storyboard_video_audio_to_export(tmp_path: Path) -> None:
+def test_narration_progresses_through_storyboard_video_to_export(tmp_path: Path) -> None:
     pm, project_path = _make_project(tmp_path, "narration")
     source_text = "完整原文"
     _write_source_and_complete(pm, project_path, source_text)
@@ -309,15 +322,19 @@ def test_narration_progresses_through_storyboard_video_audio_to_export(tmp_path:
     script["segments"][0]["generated_assets"]["video_clip"] = "videos/E1S01.mp4"
     _write_artifact(project_path, "videos/E1S01.mp4")
     atomic_write_json(script_path, script)
-    audio = service.get_status("demo")
-    assert audio.state == "AUDIO"
+    # 视频齐备即可导出：缺旁白 TTS 只在 artifacts["audio"] 里如实报告，
+    # 既不推进状态机也不拦导出（补 TTS 由用户显式发起）。
+    ready = service.get_status("demo")
+    assert ready.state == "EXPORT_READY"
+    assert ready.next_action.type == "export"
+    assert ready.artifacts["audio"]["missing_ids"] == ["E1S01"]
 
     script["segments"][0]["generated_assets"]["narration_audio"] = "audio/E1S01.wav"
     _write_artifact(project_path, "audio/E1S01.wav")
     atomic_write_json(script_path, script)
-    ready = service.get_status("demo")
-    assert ready.state == "EXPORT_READY"
-    assert ready.next_action.type == "export"
+    still_ready = service.get_status("demo")
+    assert still_ready.state == "EXPORT_READY"
+    assert still_ready.artifacts["audio"]["missing_ids"] == []
 
     (project_path / "source" / "novel.txt").write_text("全新文本", encoding="utf-8")
     refreshed_revision = compute_source_revision(
@@ -332,6 +349,77 @@ def test_narration_progresses_through_storyboard_video_audio_to_export(tmp_path:
     assert replanning.state == "EPISODE_PLAN"
     assert replanning.next_action.type == "reset_episode_planning"
     assert replanning.next_action.args == {"from_episode": 1}
+
+
+@pytest.mark.integration
+def test_narration_audio_manifest_state_unreadable_does_not_block_export(tmp_path: Path, monkeypatch) -> None:
+    """旁白 TTS 只作为信息报告，不参与状态推进：即便 Manifest 判定该条 TTS 状态不可读
+    （BLOCKED），也不能让它借道共享 blockers 列表把工作流钉在 VIDEO——视频齐备时仍须
+    到达 EXPORT_READY，不可读事实只经 artifacts["audio"]["state"] 报告。用一个只对
+    narration_audio 键抛错的假 resolver 隔离验证，不牵扯 step1/script Manifest 激活的
+    全套前置状态。"""
+    from lib.artifact_manifest import ArtifactComparison, ArtifactStatus
+
+    pm, project_path = _make_project(tmp_path, "narration")
+    source_text = "完整原文"
+    _write_source_and_complete(pm, project_path, source_text)
+
+    def _plan(project: dict) -> None:
+        project["episodes"] = [
+            {
+                "episode": 1,
+                "title": "第一集",
+                "script_file": "scripts/episode_1.json",
+                "ledger_status": "consumed",
+                "source_range": {"source_file": "source/novel.txt", "start": 0, "end": len(source_text)},
+            }
+        ]
+        project["planning_cursor"] = {"source_file": "source/novel.txt", "offset": len(source_text)}
+        project[SOURCE_FINGERPRINTS_KEY] = compute_source_fingerprints(discover_sources(project_path))
+        project["schema_version"] = 8
+
+    pm.update_project("demo", _plan)
+    draft_dir = project_path / "drafts" / "episode_1"
+    draft_dir.mkdir(parents=True)
+    atomic_write_json(draft_dir / "step1_segments.json", {"episode": 1, "segments": []})
+    script_path = project_path / "scripts" / "episode_1.json"
+    audio_path = "audio/E1S01.wav"
+    script = {
+        "episode": 1,
+        "title": "第一集",
+        "content_mode": "narration",
+        "segments": [
+            _valid_narration_segment(
+                generated_assets={
+                    "storyboard_image": "storyboards/E1S01.png",
+                    "video_clip": "videos/E1S01.mp4",
+                    "narration_audio": audio_path,
+                }
+            )
+        ],
+    }
+    _write_artifact(project_path, "storyboards/E1S01.png")
+    _write_artifact(project_path, "videos/E1S01.mp4")
+    _write_artifact(project_path, audio_path)
+    atomic_write_json(script_path, script)
+
+    class _AudioBlockedResolver:
+        """narration_audio 键 compare 抛错（BLOCKED），其余键一律 current。"""
+
+        def compare(self, key: ArtifactKey, *, artifact_path: str) -> ArtifactComparison:
+            if key == ArtifactKey.episode_audio(1, "E1S01"):
+                raise RuntimeError("manifest sidecar unreadable")
+            return ArtifactComparison(status=ArtifactStatus.CURRENT, artifact_path=artifact_path)
+
+    monkeypatch.setattr(
+        f"{WorkflowStateService.__module__}.ArtifactCurrencyResolver", lambda _project_path: _AudioBlockedResolver()
+    )
+
+    status = WorkflowStateService(pm).get_status("demo")
+
+    assert status.state == "EXPORT_READY"
+    assert status.artifacts["audio"]["state"] == "blocked"
+    assert not any(b.path == audio_path for b in status.blockers)
 
 
 @pytest.mark.integration
@@ -994,8 +1082,8 @@ def test_optional_product_sheet_does_not_block_ad_media(tmp_path: Path) -> None:
 
 
 @pytest.mark.integration
-def test_ad_reference_video_reads_completion_from_video_units(tmp_path: Path) -> None:
-    pm, project_path = _make_project(tmp_path, "ad", generation_mode="reference_video")
+def test_schema8_ad_reference_video_does_not_treat_an_unregistered_file_as_current(tmp_path: Path) -> None:
+    pm, project_path = _make_project(tmp_path, "ad", generation_mode="reference_video", activated=True)
     video_path = "reference_videos/E1U1.mp4"
     _write_artifact(project_path, video_path)
     atomic_write_json(
@@ -1007,6 +1095,43 @@ def test_ad_reference_video_reads_completion_from_video_units(tmp_path: Path) ->
             "video_units": [_valid_video_unit(unit_id="E1U1", generated_assets={"video_clip": video_path})],
         },
     )
+    register_current_artifact(project_path, ArtifactKey.episode_script(1))
+
+    status = WorkflowStateService(pm).get_status("demo")
+
+    assert status.state == "VIDEO"
+    assert status.artifacts["videos"] == {
+        "current_ids": [],
+        "missing_ids": ["E1U1"],
+        "stale_ids": [],
+    }
+
+
+@pytest.mark.integration
+def test_schema8_workflow_accepts_the_exact_selected_manual_reference_video(tmp_path: Path) -> None:
+    pm, project_path = _make_project(tmp_path, "ad", generation_mode="reference_video", activated=True)
+    video_path = "reference_videos/E1U1.mp4"
+    atomic_write_json(
+        project_path / "scripts" / "episode_1.json",
+        {
+            "episode": 1,
+            "title": "广告",
+            "content_mode": "ad",
+            "video_units": [_valid_video_unit(unit_id="E1U1", generated_assets={"video_clip": video_path})],
+        },
+    )
+    register_current_artifact(project_path, ArtifactKey.episode_script(1))
+    staged = project_path / "reference_videos" / ".E1U1.upload.mp4"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_bytes(b"manual-video")
+    VersionManager(project_path).commit_staged_version(
+        "reference_videos",
+        "E1U1",
+        "",
+        staged_file=staged,
+        current_file=project_path / video_path,
+        source=MANUAL_UPLOAD_VERSION_SOURCE,
+    )
 
     status = WorkflowStateService(pm).get_status("demo")
 
@@ -1016,6 +1141,82 @@ def test_ad_reference_video_reads_completion_from_video_units(tmp_path: Path) ->
         "missing_ids": [],
         "stale_ids": [],
     }
+    assert status.next_action.type == "export"
+
+
+@pytest.mark.integration
+def test_schema8_workflow_does_not_parse_an_unclaimed_malformed_script(tmp_path: Path) -> None:
+    pm, project_path = _make_project(tmp_path, "ad", activated=True)
+    (project_path / "scripts" / "episode_1.json").write_text("{", encoding="utf-8")
+
+    status = WorkflowStateService(pm).get_status("demo")
+
+    assert status.state == "FINAL_SCRIPT"
+    assert status.artifacts["script"] == {"state": "missing", "path": "scripts/episode_1.json"}
+    assert status.blockers == []
+    assert status.next_action.type == "generate_script"
+
+
+@pytest.mark.integration
+def test_schema8_manifest_reports_current_stale_missing_and_blocked_without_file_fallback(tmp_path: Path) -> None:
+    pm, project_path = _make_project(tmp_path, "ad")
+    sheet_path = "characters/Alice.png"
+    storyboard_path = "storyboards/scene_E1S01.png"
+    _write_artifact(project_path, sheet_path)
+    _write_artifact(project_path, storyboard_path)
+
+    def _seed(project: dict) -> None:
+        project["characters"] = {
+            "Alice": {
+                "description": "red coat",
+                "character_sheet": sheet_path,
+            }
+        }
+
+    pm.update_project("demo", _seed)
+    script_path = project_path / "scripts" / "episode_1.json"
+    script = {
+        "episode": 1,
+        "title": "广告",
+        "content_mode": "ad",
+        "shots": [
+            _valid_ad_shot(
+                image_prompt="red coat hero",
+                generated_assets={"storyboard_image": storyboard_path},
+            )
+        ],
+    }
+    atomic_write_json(script_path, script)
+    migrate_v7_to_v8(project_path)
+
+    current = WorkflowStateService(pm).get_status("demo")
+    assert current.state == "VIDEO"
+    assert current.artifacts["script"]["state"] == "current"
+    assert current.artifacts["asset_sheets"]["character"]["current_ids"] == ["Alice"]
+    assert current.artifacts["storyboards"]["current_ids"] == ["E1S01"]
+
+    pm.update_project("demo", lambda project: project["characters"]["Alice"].update(description="blue coat"))
+    script["shots"][0]["image_prompt"] = "blue coat hero"
+    atomic_write_json(script_path, script)
+    stale = WorkflowStateService(pm).get_status("demo")
+    assert stale.state == "VIDEO"
+    assert stale.artifacts["asset_sheets"]["character"]["stale_ids"] == ["Alice"]
+    assert stale.artifacts["storyboards"]["stale_ids"] == ["E1S01"]
+
+    adapter = ProjectArtifactManifestAdapter(project_path)
+    adapter.delete_entry(ArtifactKey.episode_storyboard(1, "E1S01"))
+    missing = WorkflowStateService(pm).get_status("demo")
+    assert missing.state == "STORYBOARD"
+    assert missing.artifacts["storyboards"]["missing_ids"] == ["E1S01"]
+
+    register_current_artifact(project_path, ArtifactKey.episode_storyboard(1, "E1S01"))
+    storyboard_file = project_path / storyboard_path
+    storyboard_file.unlink()
+    storyboard_file.symlink_to(project_path / sheet_path)
+    blocked = WorkflowStateService(pm).get_status("demo")
+    assert blocked.state == "VIDEO"
+    assert blocked.artifacts["storyboards"]["state"] == "blocked"
+    assert any(item.code == "artifact_symlink" for item in blocked.blockers)
 
 
 @pytest.mark.integration

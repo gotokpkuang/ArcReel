@@ -80,6 +80,28 @@ describe("API", () => {
       await expect(API.request("/projects")).rejects.toThrow("boom");
     });
 
+    it("keeps the backend message of a structured error envelope", async () => {
+      // 批量入队中途失败的信封带 code / rolled_back 等字段，只按字符串取字会把已翻译的
+      // 说明整段丢掉，用户只看到一句「请求失败」。
+      const fetchMock = vi.fn().mockResolvedValue(
+        mockResponse({
+          ok: false,
+          jsonData: {
+            detail: {
+              code: "ref_batch_enqueue_aborted",
+              message: "E1U2 入队失败，本次已创建的任务已撤销",
+              rolled_back: ["t1"],
+              orphaned: ["t0"],
+            },
+          },
+          statusText: "Service Unavailable",
+        }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      await expect(API.request("/projects")).rejects.toThrow("E1U2 入队失败，本次已创建的任务已撤销");
+    });
+
     it("falls back to statusText when error response is not JSON", async () => {
       const fetchMock = vi.fn().mockResolvedValue(
         mockResponse({
@@ -1097,6 +1119,49 @@ describe("API", () => {
         await expect(API.downloadDiagnostics()).rejects.toThrow();
       });
     });
+
+    describe("presentations", () => {
+      it("requests the selected immutable versions and rendition", async () => {
+        const fetchMock = vi.fn().mockResolvedValue(mockResponse({ jsonData: { unit_id: "E1S01" } }));
+        vi.stubGlobal("fetch", fetchMock);
+
+        await API.getPresentation("demo", "videos", "E1S01", {
+          variant: "use_tts",
+          videoVersion: 3,
+          audioVersion: 2,
+        });
+
+        expect(fetchMock.mock.calls[0][0]).toBe(
+          "/api/v1/projects/demo/presentations/videos/E1S01?variant=use_tts&video_version=3&audio_version=2",
+        );
+      });
+
+      it("downloads the editable bundle through the authenticated API path", async () => {
+        const blob = new Blob(["zip"]);
+        const fetchMock = vi.fn().mockResolvedValue(
+          mockResponse({
+            blobData: blob,
+            headers: { "Content-Disposition": 'attachment; filename="E1S01_presentation.zip"' },
+          }),
+        );
+        vi.stubGlobal("fetch", fetchMock);
+
+        const result = await API.downloadPresentationBundle("demo", "reference_videos", "E1U01", {
+          variant: "post_production",
+          videoVersion: 7,
+        });
+
+        expect(result).toEqual({ blob, filename: "E1S01_presentation.zip" });
+        expect(fetchMock.mock.calls[0][0]).toBe(
+          "/api/v1/projects/demo/presentations/reference_videos/E1U01/bundle?variant=post_production&video_version=7",
+        );
+      });
+
+      it("includes the selected presentation variant in Jianying download URLs", () => {
+        expect(API.getJianyingDraftDownloadUrl("demo", 1, "/drafts", "token", "6", "use_tts"))
+          .toContain("narration_delivery=use_tts");
+      });
+    });
   });
 
   describe("listAssets", () => {
@@ -1241,6 +1306,31 @@ describe("API.referenceVideos", () => {
       narration_delivery: "use_tts",
       confirmed_request_duration_seconds: 12,
     });
+  });
+
+  it("generateReferenceVideoBatch posts the batch admission payload", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ decision: "admitted", task_ids: ["t-1"], units: [], deduped: false }),
+        { status: 200 },
+      ),
+    );
+
+    const res = await API.generateReferenceVideoBatch("proj", 1, {
+      narration_delivery: "post_production",
+      unit_ids: ["E1U1", "E1U2"],
+      confirmed_request_durations: { E1U1: 8 },
+    });
+
+    expect(fetchMock.mock.calls[0]![0]).toContain(
+      "/projects/proj/reference-videos/episodes/1/units/generate-batch",
+    );
+    expect(JSON.parse(fetchMock.mock.calls[0]![1]!.body as string)).toEqual({
+      narration_delivery: "post_production",
+      unit_ids: ["E1U1", "E1U2"],
+      confirmed_request_durations: { E1U1: 8 },
+    });
+    expect(res.decision).toBe("admitted");
   });
 
   it("precheckReferenceVideoDuration sends narration projection options", async () => {

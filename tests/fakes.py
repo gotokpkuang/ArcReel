@@ -7,13 +7,107 @@ Single-file fakes stay in their respective test modules.
 from __future__ import annotations
 
 import asyncio
+import itertools
+import json
+from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, patch
 
 from instructor.core import InstructorRetryException
 
 if TYPE_CHECKING:
+    from lib.media_generator import MediaGenerator
     from lib.reference_video.voice_settings import VoiceRenderSettings
+    from lib.version_manager import PaidVersionCommit
+
+
+class FakeProjectAssetMutationMixin:
+    """Share production-shaped asset mutation contracts across router fakes."""
+
+    expected_delete_asset_table: str | None = None
+
+    def load_project(self, project_name: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def update_project(self, project_name: str, mutate_fn: Callable[[dict], None]) -> Any:
+        raise NotImplementedError
+
+    def update_asset_entry(
+        self,
+        asset_type: str,
+        project_name: str,
+        name: str,
+        mutate_fn: Callable[[dict], None],
+    ) -> dict[str, Any]:
+        from lib.asset_types import ASSET_SPECS, resolve_asset_key
+
+        spec = ASSET_SPECS[asset_type]
+        result: dict[str, Any] = {}
+
+        def _mutate(project: dict) -> None:
+            bucket = project.get(spec.bucket_key) or {}
+            key = resolve_asset_key(bucket, name)
+            if key is None:
+                raise KeyError(name)
+            entry = bucket[key]
+            mutate_fn(entry)
+            result.update(entry)
+
+        self.update_project(project_name, _mutate)
+        return result
+
+    def delete_asset(self, project_name: str, table: str, name: str) -> dict[str, Any]:
+        from lib.asset_types import resolve_asset_key
+
+        if self.expected_delete_asset_table is not None:
+            assert table == self.expected_delete_asset_table
+        project = self.load_project(project_name)
+        bucket = project.get(table) or {}
+        key = resolve_asset_key(bucket, name)
+        if key is None:
+            raise KeyError(name)
+        del bucket[key]
+        return project
+
+
+def persist_fake_script(project_path: Path, script_file: object, script: object) -> None:
+    """Mirror an in-memory fake script through the production scripts directory."""
+
+    normalized = str(script_file).replace("\\", "/").removeprefix("scripts/")
+    target = project_path / "scripts" / normalized
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(script, ensure_ascii=False), encoding="utf-8")
+
+
+def select_formal_video(
+    generator: MediaGenerator,
+    *,
+    resource_type: str = "reference_videos",
+    resource_id: str = "E1U1",
+    prompt: str = "",
+) -> Callable[[Path, Path, int, Mapping[str, Any]], PaidVersionCommit]:
+    """Build the minimal paid-video formal commit callback used by generator tests."""
+
+    def _commit(
+        staged_file: Path,
+        current_file: Path,
+        duration_seconds: int,
+        version_metadata: Mapping[str, Any],
+    ) -> PaidVersionCommit:
+        return generator.versions.commit_staged_paid_version(
+            resource_type=resource_type,
+            resource_id=resource_id,
+            prompt=prompt,
+            staged_file=staged_file,
+            current_file=current_file,
+            select_current=True,
+            duration_seconds=duration_seconds,
+            **version_metadata,
+        )
+
+    return _commit
 
 
 class FakeSDKClient:
@@ -332,3 +426,19 @@ def instructor_api_call_exhausted(cause: Exception) -> InstructorRetryException:
     )
     exc.__cause__ = cause
     return exc
+
+
+@contextmanager
+def bounded_poll_clock(step: float = 30.0):
+    """把 ``poll_with_retry`` 的时钟换成假表：sleep 不真等，每读一次表推进 step 秒。
+
+    终态判定失灵时（把已就绪的任务当成"仍在跑"），真实时钟下 sleep 被 mock 掉的轮询会以近乎
+    为零的真实耗时空转到天荒地老——测试表现为挂起而不是失败。假表让这类回归在几十次轮询内
+    撞上 ``max_wait`` 抛 ``TimeoutError``，红得快且可读。
+    """
+    clock = itertools.count(0.0, step)
+    with (
+        patch("lib.video_backends.base.asyncio.sleep", new_callable=AsyncMock),
+        patch("lib.video_backends.base.time.monotonic", side_effect=lambda: next(clock)),
+    ):
+        yield

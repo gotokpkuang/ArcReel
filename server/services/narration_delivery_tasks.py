@@ -10,20 +10,29 @@ from __future__ import annotations
 import asyncio
 import filecmp
 import math
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from lib.artifact_activation import resolve_artifact_episode
+from lib.artifact_manifest import (
+    ArtifactKey,
+    ArtifactManifestEntry,
+    ArtifactManifestError,
+    ProjectArtifactManifestAdapter,
+)
 from lib.audio_utils import probe_existing_media_duration_seconds
 from lib.config.resolver import ConfigResolver, VideoCapability
 from lib.db import async_session_factory
+from lib.db.base import DEFAULT_USER_ID
 from lib.generation_queue import GenerationQueue, get_generation_queue
 from lib.narration_delivery import (
     NarratedVideoDurationBlockedError,
     NarratedVideoDurationPreparation,
     NarrationDeliveryPreparation,
     NarrationDeliveryRequestOptions,
+    NarrationTtsStatus,
     TtsSettingsResolver,
     TtsSynthesisSettings,
     VideoRequestCostFacts,
@@ -31,7 +40,7 @@ from lib.narration_delivery import (
     prepare_narrated_video_duration,
     prepare_narrated_video_output,
 )
-from lib.path_safety import safe_join, try_safe_join
+from lib.path_safety import try_safe_join
 from lib.project_manager import ProjectManager, get_project_manager
 from lib.reference_video.prompt_render import render_video_unit_prompt, resolve_reference_audio_paths
 from lib.reference_video.request_projection import (
@@ -46,13 +55,14 @@ from lib.reference_video.request_projection import (
     resolve_reference_assets,
 )
 from lib.reference_video.voice_settings import VoiceRenderSettings
-from lib.resource_paths import END_FRAME_RESOURCE_TYPE, resource_relative_path
+from lib.resource_paths import resource_relative_path
 from lib.script_editor import resolve_items
-from lib.script_models import get_generated_assets, resolve_content_mode
+from lib.script_models import resolve_content_mode
 from lib.script_skeleton import resolve_script_kind
 from lib.speech_composition import admit_script_unit
-from lib.storyboard_sequence import resolve_storyboard_image_ref
+from lib.storyboard_sequence import resolve_storyboard_video_inputs
 from lib.version_manager import VersionManager
+from lib.video_artifact_facts import VideoArtifactCurrencyFacts
 from lib.video_visual_provenance import (
     build_reference_video_visual_basis,
     build_storyboard_video_visual_basis,
@@ -86,15 +96,31 @@ class ResolvedTtsSettingsResolver:
 class CurrentTtsSettingsResolver:
     """Resolve freshness inputs through the same assembled audio lane as synthesis."""
 
-    def __init__(self, project_name: str) -> None:
+    def __init__(
+        self,
+        project_name: str,
+        *,
+        user_id: str = DEFAULT_USER_ID,
+        project_path: Path | None = None,
+        context_resolver: Callable[..., Awaitable[Any]] | None = None,
+    ) -> None:
         self._project_name = project_name
+        self._user_id = user_id
+        self._project_path = project_path
+        self._context_resolver = context_resolver or resolve_generation_context
 
     async def resolve_tts_synthesis_settings(self, project: dict) -> TtsSynthesisSettings:
-        ctx = await resolve_generation_context(
+        context_kwargs: dict[str, Any] = {
+            "project": project,
+            "user_id": self._user_id,
+            "audio": AudioLaneRequest(),
+        }
+        if self._project_path is not None:
+            context_kwargs["project_path"] = self._project_path
+        ctx = await self._context_resolver(
             self._project_name,
             None,
-            project=project,
-            audio=AudioLaneRequest(),
+            **context_kwargs,
         )
         return ResolvedTtsSettingsResolver.from_audio_lane(ctx.audio).settings
 
@@ -108,14 +134,8 @@ def _selected_current_video_record(
     resource_id: str,
     visual_basis_digest: str | None,
 ) -> tuple[str, Path, dict[str, Any], int] | None:
-    if item.get("stale"):
-        return None
-    assets = item.get("generated_assets")
-    if not isinstance(assets, dict) or assets.get("status") != "completed":
-        return None
+    del item  # Script path/status fields are presentation metadata, not artifact currency.
     canonical_rel = resource_relative_path(resource_type, resource_id)
-    if assets.get("video_clip") != canonical_rel:
-        return None
 
     formal_file = try_safe_join(project_path, canonical_rel, require_file=True)
     if formal_file is None:
@@ -138,6 +158,23 @@ def _selected_current_video_record(
         None,
     )
     if current_record is None:
+        return None
+    try:
+        artifact_currency = VideoArtifactCurrencyFacts.from_dict(current_record.get("artifact_video_currency"))
+    except (TypeError, ValueError):
+        return None
+    episode = artifact_currency.episode
+    recorded_basis = artifact_currency.video_descriptor
+    try:
+        manifest_entry = ProjectArtifactManifestAdapter(project_path).get_entry(
+            ArtifactKey.episode_video(episode, resource_id)
+        )
+    except ArtifactManifestError:
+        return None
+    if manifest_entry != ArtifactManifestEntry(
+        artifact_path=canonical_rel,
+        basis_digest=recorded_basis.digest,
+    ):
         return None
     if not visual_basis_digest or current_record.get("visual_basis_digest") != visual_basis_digest:
         return None
@@ -432,7 +469,12 @@ async def prepare_current_storyboard_narrated_video_duration(
         )
     narration = await prepare_current_narration_delivery(
         project=project,
-        episode=ProjectManager.resolve_episode_from_script(script, script_file),
+        episode=resolve_artifact_episode(
+            project=project,
+            script=script,
+            script_filename=script_file,
+        )
+        or ProjectManager.resolve_episode_from_script(script, script_file),
         preparation=preparation,
         project_path=project_path,
         delivery="use_tts",
@@ -519,7 +561,11 @@ async def prepare_current_reference_video_request_options(
     if options.narration_delivery == USE_TTS:
         if not script_file:
             raise ValueError("use_tts reference projection requires script_file")
-        episode = ProjectManager.resolve_episode_from_script(script, script_file)
+        episode = resolve_artifact_episode(
+            project=project,
+            script=script,
+            script_filename=script_file,
+        ) or ProjectManager.resolve_episode_from_script(script, script_file)
     prepared = await materialize_current_reference_request_options(
         project=project,
         script=script,
@@ -567,45 +613,6 @@ async def prepare_current_reference_video_request_options(
     )
 
 
-def resolve_storyboard_video_inputs(
-    *,
-    project_path: Path,
-    resource_id: str,
-    item: dict[str, Any],
-) -> tuple[Path, Path | None]:
-    """Resolve the exact current storyboard and optional canonical end-frame inputs."""
-
-    storyboard_rel = get_generated_assets(item).get("storyboard_image")
-    storyboard_file = resolve_storyboard_image_ref(project_path, storyboard_rel)
-    if storyboard_file is None:
-        storyboard_file = project_path / "storyboards" / f"scene_{resource_id}.png"
-    if not storyboard_file.is_file():
-        raise ValueError(f"storyboard not found: {storyboard_file.name}")
-
-    end_frame_rel = item.get("end_frame_image")
-    if end_frame_rel in (None, ""):
-        return storyboard_file, None
-    if not isinstance(end_frame_rel, str):
-        raise ValueError(f"invalid end frame snapshot path: {end_frame_rel!r}")
-    normalized = end_frame_rel.strip().replace("\\", "/")
-    candidate = normalized if "/" in normalized else f"{END_FRAME_RESOURCE_TYPE}/{normalized}"
-    expected_rel = resource_relative_path(END_FRAME_RESOURCE_TYPE, resource_id)
-    end_frame_file = try_safe_join(project_path, candidate)
-    expected_file = safe_join(project_path, expected_rel)
-    canonical_path_tampered = False
-    current = project_path
-    for component in Path(expected_rel).parts:
-        current = current / component
-        if current.is_symlink() or current.is_junction():
-            canonical_path_tampered = True
-            break
-    if end_frame_file is None or end_frame_file != expected_file or canonical_path_tampered:
-        raise ValueError(f"invalid end frame snapshot path: {end_frame_rel!r}")
-    if not end_frame_file.is_file():
-        raise ValueError(f"end frame snapshot not found: {end_frame_file.name}")
-    return storyboard_file, end_frame_file
-
-
 def _storyboard_visual_basis_digest(
     *,
     project: dict[str, Any],
@@ -624,6 +631,7 @@ def _storyboard_visual_basis_digest(
     try:
         storyboard_file, end_frame_file = resolve_storyboard_video_inputs(
             project_path=project_path,
+            project=project,
             resource_id=resource_id,
             item=item,
         )
@@ -685,10 +693,35 @@ def reference_video_visual_basis_digest(
     else:
         audio_speakers = list(rendered.audio_speakers)
         audio_targets = None
-    return build_reference_video_visual_basis(
+    return materialized_reference_video_visual_basis_digest(
         rendered_prompt=rendered.prompt,
         aspect_ratio=resolve_video_aspect_ratio(project),
         reference_images=[asset.path for asset in request_assets],
+        request_assets=request_assets,
+        reference_audio_files=[audio_paths[speaker] for speaker in audio_speakers],
+        reference_audio_speakers=audio_speakers,
+        reference_audio_targets=audio_targets,
+        candidate=candidate,
+    )
+
+
+def materialized_reference_video_visual_basis_digest(
+    *,
+    rendered_prompt: object,
+    aspect_ratio: object,
+    reference_images: Sequence[Path],
+    request_assets: Sequence[ResolvedReferenceAsset],
+    reference_audio_files: Sequence[Path],
+    reference_audio_speakers: Sequence[str],
+    reference_audio_targets: Sequence[int] | None,
+    candidate: ProviderProjectionCandidate,
+) -> str:
+    """Hash a fully rendered request against the exact media bytes that will be submitted."""
+
+    return build_reference_video_visual_basis(
+        rendered_prompt=rendered_prompt,
+        aspect_ratio=aspect_ratio,
+        reference_images=reference_images,
         reference_descriptors=[
             {
                 "type": asset.reference.type,
@@ -697,9 +730,9 @@ def reference_video_visual_basis_digest(
             }
             for asset in request_assets
         ],
-        reference_audio_files=[audio_paths[speaker] for speaker in audio_speakers],
-        reference_audio_speakers=audio_speakers,
-        reference_audio_targets=audio_targets,
+        reference_audio_files=reference_audio_files,
+        reference_audio_speakers=reference_audio_speakers,
+        reference_audio_targets=reference_audio_targets,
         request_context={
             "capability": candidate.capability,
             "provider_id": candidate.provider_id,
@@ -760,12 +793,84 @@ async def require_generated_video_covers_current_tts(
 ) -> None:
     """Reject a paid video unless it covers the latest current TTS in full."""
 
+    try:
+        await validate_generated_video_covers_current_tts(
+            project_name=project_name,
+            script_file=script_file,
+            request_duration_seconds=request_duration_seconds,
+            output_path=output_path,
+            resource_type=resource_type,
+            resource_id=resource_id,
+        )
+    except NarratedVideoDurationBlockedError:
+        await asyncio.to_thread(
+            versions.reject_current_version,
+            resource_type,
+            resource_id,
+            rejected_version=version,
+            current_file=output_path,
+        )
+        raise
+
+
+async def validate_generated_video_covers_current_tts(
+    *,
+    project_name: str,
+    script_file: str,
+    request_duration_seconds: int,
+    output_path: Path,
+    resource_type: str,
+    resource_id: str,
+) -> None:
+    """Validate staged paid media before it can become the formal selection."""
+
     narration = await _prepare_current_task_narration_delivery(
         project_name=project_name,
         script_file=script_file,
         resource_type=resource_type,
         resource_id=resource_id,
     )
+    await _validate_generated_video_covers_narration(
+        narration=narration,
+        request_duration_seconds=request_duration_seconds,
+        output_path=output_path,
+    )
+
+
+async def validate_generated_video_covers_tts_duration(
+    *,
+    resource_id: str,
+    request_duration_seconds: int,
+    output_path: Path,
+    tts_actual_duration_seconds: float,
+) -> None:
+    """Validate paid media against the immutable TTS duration accepted at submit."""
+
+    if not math.isfinite(tts_actual_duration_seconds) or tts_actual_duration_seconds <= 0:
+        raise ValueError("execution TTS duration must be positive and finite")
+    narration = NarrationDeliveryPreparation(
+        delivery=USE_TTS,
+        unit_id=resource_id,
+        speech_mode=None,
+        tts_status=NarrationTtsStatus.CURRENT,
+        artifact_path="",
+        basis_digest=None,
+        actual_duration_seconds=tts_actual_duration_seconds,
+        problems=(),
+    )
+    await _validate_generated_video_covers_narration(
+        narration=narration,
+        request_duration_seconds=request_duration_seconds,
+        output_path=output_path,
+    )
+
+
+async def _validate_generated_video_covers_narration(
+    *,
+    narration: NarrationDeliveryPreparation,
+    request_duration_seconds: int,
+    output_path: Path,
+) -> None:
     actual_duration = await probe_existing_media_duration_seconds(output_path)
     preparation = NarratedVideoDurationPreparation(
         narration=narration,
@@ -781,13 +886,6 @@ async def require_generated_video_covers_current_tts(
     )
     if checked.allowed:
         return
-    await asyncio.to_thread(
-        versions.reject_current_version,
-        resource_type,
-        resource_id,
-        rejected_version=version,
-        current_file=output_path,
-    )
     raise NarratedVideoDurationBlockedError(checked)
 
 
@@ -824,7 +922,11 @@ async def _prepare_current_task_narration_delivery(
         )
         if item is None:
             raise ValueError(f"narration unit not found: {resource_id}")
-        episode = ProjectManager.resolve_episode_from_script(script, script_file)
+        episode = resolve_artifact_episode(
+            project=project,
+            script=script,
+            script_filename=script_file,
+        ) or ProjectManager.resolve_episode_from_script(script, script_file)
         return project, project_path, episode, admit_script_unit(kind, item).preparation
 
     project, project_path, episode, preparation = await asyncio.to_thread(_load)
@@ -849,9 +951,12 @@ __all__ = [
     "current_selected_video_tier",
     "current_reusable_video_tier",
     "prepare_current_storyboard_narrated_video_duration",
+    "materialized_reference_video_visual_basis_digest",
     "prepare_current_reference_video_request_options",
     "ResolvedTtsSettingsResolver",
     "require_generated_video_covers_current_tts",
+    "validate_generated_video_covers_tts_duration",
+    "validate_generated_video_covers_current_tts",
     "reuse_current_video_for_tier",
     "tts_task_in_progress",
 ]

@@ -56,6 +56,8 @@ import type {
   ReferenceProjectionAdmission,
   NarratedVideoDurationAdmission,
   ReferenceGenerationRequestOptions,
+  ReferenceBatchAdmission,
+  ReferenceBatchGenerateRequest,
   ReferenceRequestOptions,
   ScriptPreview,
   ScriptReviewState,
@@ -66,7 +68,13 @@ import type {
 } from "@/types";
 import type { GenerationRoute } from "@/utils/generation-mode";
 import type { GridCapability, GridGeneration } from "@/types/grid";
+import type {
+  PresentationReadModel,
+  PresentationRequestOptions,
+  PresentationResourceType,
+} from "@/types/presentation";
 import type { Asset, AssetType, AssetCreatePayload, AssetUpdatePayload } from "@/types/asset";
+import type { WorkflowPlan, WorkflowPlanRequest } from "@/types/workflow";
 import type {
   AgentCredential,
   CreateAgentCredentialRequest,
@@ -102,6 +110,19 @@ function referenceRequestQuery(
   }
   const serialized = query.toString();
   return serialized ? `?${serialized}` : "";
+}
+
+function presentationEndpoint(
+  projectName: string,
+  resourceType: PresentationResourceType,
+  resourceId: string,
+  options: PresentationRequestOptions,
+  suffix = "",
+): string {
+  const query = new URLSearchParams({ variant: options.variant ?? "post_production" });
+  if (options.videoVersion !== undefined) query.set("video_version", String(options.videoVersion));
+  if (options.audioVersion !== undefined) query.set("audio_version", String(options.audioVersion));
+  return `/projects/${encodeURIComponent(projectName)}/presentations/${resourceType}/${encodeURIComponent(resourceId)}${suffix}?${query.toString()}`;
 }
 
 /** 资产级联重命名的影响报告（dry_run 预览与执行同一结构）。 */
@@ -283,6 +304,10 @@ export interface VersionInfo {
   created_at: string;
   file_size: number;
   is_current: boolean;
+  /** Whether this history record carries verified provenance for restore. */
+  restorable?: boolean;
+  /** Whether the shared presentation reader can preview/export this video version. */
+  presentation_available?: boolean;
   file_url?: string;
   prompt?: string;
   restored_from?: number;
@@ -431,6 +456,29 @@ function normalizeExportDiagnostics(value: unknown): ExportDiagnostics {
 const API_BASE = "/api/v1";
 
 /**
+ * 从后端 detail 中取一句可读的说明。
+ *
+ * 后端把 `{ code, message, ... }` 这样的信封当 detail 抛出的场合（如批量入队中途失败后的
+ * 撤销结果），只按字符串与数组取字会把已翻译的说明整段丢掉，用户只收到一句「请求失败」。
+ */
+function messageFromDetail(detail: unknown, fallback: string): string {
+  if (typeof detail === "string") return detail || fallback;
+  if (Array.isArray(detail) && detail.length > 0) {
+    return (
+      detail
+        .map((e) => (typeof e === "string" ? e : (e as { msg?: string } | null)?.msg))
+        .filter(Boolean)
+        .join("; ") || fallback
+    );
+  }
+  if (detail && typeof detail === "object") {
+    const message = (detail as { message?: unknown }).message;
+    if (typeof message === "string" && message) return message;
+  }
+  return fallback;
+}
+
+/**
  * 检查 fetch 响应状态，抛出包含后端错误信息的 Error。
  * 用于不经过 API.request() 的自定义 fetch 调用。
  */
@@ -450,7 +498,7 @@ async function throwIfNotOk(response: Response, fallbackMsg: string): Promise<vo
     if (isSpeechAdmission(detail)) {
       throw new SpeechAdmissionError(detail);
     }
-    throw new Error(typeof detail === "string" ? detail || fallbackMsg : fallbackMsg);
+    throw new Error(messageFromDetail(detail, fallbackMsg));
   }
 }
 
@@ -764,13 +812,7 @@ class API {
       if (isSpeechAdmission(error.detail)) {
         throw new SpeechAdmissionError(error.detail);
       }
-      let message = "请求失败";
-      if (typeof error.detail === "string") {
-        message = error.detail;
-      } else if (Array.isArray(error.detail) && error.detail.length > 0) {
-        message = error.detail.map((e) => (typeof e === "string" ? e : e?.msg)).filter(Boolean).join("; ") || message;
-      }
-      throw new Error(message);
+      throw new Error(messageFromDetail(error.detail, "请求失败"));
     }
 
     if (response.status === 204) {
@@ -947,8 +989,33 @@ class API {
     draftPath: string,
     downloadToken: string,
     jianyingVersion: string = "6",
+    narrationDelivery: "post_production" | "use_tts" = "post_production",
   ): string {
-    return `${API_BASE}/projects/${encodeURIComponent(projectName)}/export/jianying-draft?episode=${encodeURIComponent(episode)}&draft_path=${encodeURIComponent(draftPath)}&download_token=${encodeURIComponent(downloadToken)}&jianying_version=${encodeURIComponent(jianyingVersion)}`;
+    return `${API_BASE}/projects/${encodeURIComponent(projectName)}/export/jianying-draft?episode=${encodeURIComponent(episode)}&draft_path=${encodeURIComponent(draftPath)}&download_token=${encodeURIComponent(downloadToken)}&jianying_version=${encodeURIComponent(jianyingVersion)}&narration_delivery=${encodeURIComponent(narrationDelivery)}`;
+  }
+
+  static async getPresentation(
+    projectName: string,
+    resourceType: PresentationResourceType,
+    resourceId: string,
+    options: PresentationRequestOptions = {},
+  ): Promise<PresentationReadModel> {
+    const endpoint = presentationEndpoint(projectName, resourceType, resourceId, options);
+    return this.request(endpoint, { signal: options.signal });
+  }
+
+  static async downloadPresentationBundle(
+    projectName: string,
+    resourceType: PresentationResourceType,
+    resourceId: string,
+    options: PresentationRequestOptions = {},
+  ): Promise<{ blob: Blob; filename: string }> {
+    const endpoint = presentationEndpoint(projectName, resourceType, resourceId, options, "/bundle");
+    const response = await fetch(`${API_BASE}${endpoint}`, withAuth(endpoint));
+    await throwIfNotOk(response, `HTTP ${response.status}`);
+    const disposition = response.headers.get("Content-Disposition") ?? "";
+    const filename = disposition.match(/filename="?([^";]+)"?/)?.[1] ?? `${resourceId}_presentation.zip`;
+    return { blob: await response.blob(), filename };
   }
 
   static async importProject(
@@ -1519,6 +1586,22 @@ class API {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/files`
     );
+  }
+
+  /**
+   * 取本次请求的权威工作流计划。无副作用：不入队、不写项目，
+   * `narration_delivery` 与 `confirmed_request_durations` 只作用于这一次求解。
+   */
+  static async getWorkflowPlan(
+    projectName: string,
+    request: WorkflowPlanRequest = {},
+    options: { signal?: AbortSignal } = {}
+  ): Promise<WorkflowPlan> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/workflow-plan`, {
+      method: "POST",
+      body: JSON.stringify(request),
+      signal: options.signal,
+    });
   }
 
   static getFileUrl(
@@ -2972,6 +3055,23 @@ class API {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units/${encodeURIComponent(unitId)}/generate`,
       { method: "POST", body: JSON.stringify(options) },
+    );
+  }
+
+  /**
+   * 批量生成的全有或全无准入：一次请求评估全部目标单元。
+   *
+   * 恒返回 200——`decision` 携带结局，只有 `admitted` 建了任务；
+   * `confirmation_required` 与 `blocked` 一个任务也没建，须按结论再决定下一步。
+   */
+  static async generateReferenceVideoBatch(
+    projectName: string,
+    episode: number,
+    payload: ReferenceBatchGenerateRequest,
+  ): Promise<ReferenceBatchAdmission> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units/generate-batch`,
+      { method: "POST", body: JSON.stringify(payload) },
     );
   }
 

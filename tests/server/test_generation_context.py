@@ -178,6 +178,31 @@ class TestLaneDeclaration:
             _ = ctx.image
 
     @pytest.mark.unit
+    async def test_preloaded_project_path_avoids_the_default_executor(
+        self,
+        session_factory,
+        project_env,
+        fake_assemble,
+        monkeypatch,
+    ):
+        project_path = project_env.get_project_path("demo")
+
+        async def _unexpected_to_thread(*_args, **_kwargs):
+            pytest.fail("a preloaded project path must not re-enter the default executor")
+
+        monkeypatch.setattr(generation_context.asyncio, "to_thread", _unexpected_to_thread)
+
+        ctx = await resolve_generation_context(
+            "demo",
+            None,
+            project={"audio_backend": "dashscope/tts-model-x"},
+            project_path=project_path,
+            audio=AudioLaneRequest(),
+        )
+
+        assert ctx.generator.project_path == project_path
+
+    @pytest.mark.unit
     async def test_i2i_capability_selects_i2i_slot(self, session_factory, project_env, fake_assemble):
         project = {
             "image_provider_t2i": "ark/img-t2i",
@@ -285,7 +310,7 @@ class TestVideoLane:
 
     @pytest.mark.unit
     async def test_payload_overrides_project(self, session_factory, project_env, fake_assemble):
-        """payload > project：入队锁定的桶键决定实际解析身份。"""
+        """payload > project：显式的请求身份（如 checkpoint 回放）决定实际解析身份。"""
         ark_model = _registry_video_model("ark")
         grok_model = _registry_video_model("grok")
         ctx = await resolve_generation_context(

@@ -18,7 +18,8 @@ import stat
 import tempfile
 import threading
 import time
-from collections.abc import Iterator, Mapping
+import unicodedata
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
@@ -27,15 +28,17 @@ from typing import Protocol, Self, cast
 
 import portalocker
 
-from lib.asset_types import ASSET_TYPES, normalize_asset_name
+from lib.asset_types import ASSET_TYPES, asset_name_comparison_key
 
 _KEY_PREFIX = "artifact-key-v1:"
 MANIFEST_FILENAME = ".arcreel_artifacts.json"
 LOCK_FILENAME = ".artifact_manifest.lock"
 MANIFEST_SCHEMA_VERSION = 1
+ARCHIVE_MANIFEST_SCHEMA_VERSION = 2
 HASH_ALGORITHM = "sha256-v1"
 LOCK_TIMEOUT_SECONDS = 10.0
 _DIGEST_RE = re.compile(r"sha256-v1:[0-9a-f]{64}\Z")
+_CONTENT_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _RESERVED_ARTIFACT_PATHS = frozenset({MANIFEST_FILENAME, LOCK_FILENAME})
 _WINDOWS_RESERVED_ARTIFACT_PATHS = frozenset(path.casefold() for path in _RESERVED_ARTIFACT_PATHS)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -51,6 +54,8 @@ class ArtifactKind(StrEnum):
     EPISODE_STORYBOARD = "episode-storyboard"
     EPISODE_VIDEO = "episode-video"
     EPISODE_AUDIO = "episode-audio"
+    EPISODE_SUBTITLE = "episode-subtitle"
+    EPISODE_PRESENTATION = "episode-presentation"
 
 
 class ArtifactStatus(StrEnum):
@@ -95,10 +100,20 @@ class ArtifactManifestEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class ArtifactManifestArchiveSnapshot:
+    """Complete portable claims bound to the exported formal artifact bytes."""
+
+    entries: Mapping[ArtifactKey, ArtifactManifestEntry]
+    content_digests: Mapping[ArtifactKey, str]
+
+
+@dataclass(frozen=True, slots=True)
 class ArtifactObservation:
     artifact_path: str
     present: bool
     blocker: ArtifactBlocker | None = None
+    content_digest: str | None = None
+    content_bytes: bytes | None = None
 
 
 class ArtifactManifestAdapter(Protocol):
@@ -110,11 +125,106 @@ class ArtifactManifestAdapter(Protocol):
     def get_entry(self, key: ArtifactKey) -> ArtifactManifestEntry | None:
         raise NotImplementedError
 
+    def snapshot_entries(self) -> Mapping[ArtifactKey, ArtifactManifestEntry]:
+        """Return one decoded snapshot of the complete Manifest."""
+
+        raise NotImplementedError
+
     def put_entry(self, key: ArtifactKey, entry: ArtifactManifestEntry) -> bool:
         raise NotImplementedError
 
     def delete_entry(self, key: ArtifactKey) -> bool:
         raise NotImplementedError
+
+    def replace_entries_if_matches_atomically(
+        self,
+        *,
+        expected: Mapping[ArtifactKey, ArtifactManifestEntry | None],
+        replacements: Mapping[ArtifactKey, ArtifactManifestEntry | None],
+    ) -> bool:
+        """Compare-and-swap a scoped set of claims in one storage commit."""
+
+        raise NotImplementedError
+
+    def replace_snapshot_if_matches_atomically(
+        self,
+        *,
+        expected: Mapping[ArtifactKey, ArtifactManifestEntry],
+        replacement: Mapping[ArtifactKey, ArtifactManifestEntry],
+    ) -> bool:
+        """Replace a complete snapshot only when the complete current state matches."""
+
+        raise NotImplementedError
+
+    def replace_entries_atomically(
+        self,
+        entries: Mapping[ArtifactKey, ArtifactManifestEntry],
+    ) -> bool:
+        """Replace the complete manifest target state in one storage commit."""
+
+        raise NotImplementedError
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactEntryRekeyReceipt:
+    """Committed claim rekey that can restore its exact prior key state."""
+
+    adapter: ArtifactManifestAdapter
+    before: Mapping[ArtifactKey, ArtifactManifestEntry | None]
+    after: Mapping[ArtifactKey, ArtifactManifestEntry | None]
+    changed: bool
+
+    def compensate(self) -> bool:
+        if not self.changed:
+            return False
+        if self.adapter.replace_entries_if_matches_atomically(
+            expected=self.after,
+            replacements=self.before,
+        ):
+            return True
+        if _entries_match(self.adapter, self.before):
+            return False
+        raise ArtifactManifestError("artifact claim rekey changed concurrently and could not be restored")
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactEntryRekeyPlan:
+    """Preflighted, whole-Manifest claim rekey used by identity transactions."""
+
+    adapter: ArtifactManifestAdapter
+    before: Mapping[ArtifactKey, ArtifactManifestEntry | None]
+    after: Mapping[ArtifactKey, ArtifactManifestEntry | None]
+    changed: bool
+
+    def commit(self) -> ArtifactEntryRekeyReceipt:
+        receipt = ArtifactEntryRekeyReceipt(
+            adapter=self.adapter,
+            before=self.before,
+            after=self.after,
+            changed=self.changed,
+        )
+        if not self.changed:
+            return receipt
+        try:
+            changed = self.adapter.replace_entries_if_matches_atomically(
+                expected=self.before,
+                replacements=self.after,
+            )
+        except BaseException as original_error:
+            try:
+                restored = self.adapter.replace_entries_if_matches_atomically(
+                    expected=self.after,
+                    replacements=self.before,
+                )
+                if not restored and not _entries_match(self.adapter, self.before):
+                    raise ArtifactManifestError("artifact claim rekey did not leave a recoverable state")
+            except BaseException as rollback_error:
+                rollback_error.__cause__ = original_error
+                raise RuntimeError("artifact claim rekey failed and rollback was incomplete") from rollback_error
+            raise
+        if not changed:
+            raise ArtifactManifestError("artifact claims changed after the rekey preflight")
+        return receipt
 
 
 class ArtifactManifest:
@@ -124,6 +234,30 @@ class ArtifactManifest:
         self._adapter = adapter
 
     def register(self, key: ArtifactKey, *, artifact_path: str, basis: ArtifactBasis) -> bool:
+        if not isinstance(basis, ArtifactBasis):
+            raise TypeError("basis must be an ArtifactBasis")
+        return self.register_descriptor(
+            key,
+            artifact_path=artifact_path,
+            basis=ArtifactBasisDescriptor.from_basis(basis),
+        )
+
+    def register_descriptor(
+        self,
+        key: ArtifactKey,
+        *,
+        artifact_path: str,
+        basis: ArtifactBasisDescriptor,
+    ) -> bool:
+        """Register source evidence frozen before the formal artifact commit.
+
+        Checkpoints and version metadata intentionally carry only strict
+        descriptors. Accepting that portable form avoids reconstructing or
+        guessing the original input payload during resume and restore.
+        """
+
+        if not isinstance(basis, ArtifactBasisDescriptor):
+            raise TypeError("basis must be an ArtifactBasisDescriptor")
         observation = self._adapter.inspect_artifact(artifact_path)
         if observation.blocker is not None:
             raise ArtifactRegistrationError(observation.blocker.detail)
@@ -137,7 +271,181 @@ class ArtifactManifest:
             ),
         )
 
+    def register_descriptor_transactionally(
+        self,
+        key: ArtifactKey,
+        *,
+        artifact_path: str,
+        basis: ArtifactBasisDescriptor,
+    ) -> bool:
+        """Register a descriptor while restoring the exact prior entry on error."""
+
+        if not isinstance(basis, ArtifactBasisDescriptor):
+            raise TypeError("basis must be an ArtifactBasisDescriptor")
+        previous = self._adapter.get_entry(key)
+        expected = ArtifactManifestEntry(
+            artifact_path=normalize_artifact_path(artifact_path),
+            basis_digest=basis.digest,
+        )
+        try:
+            return self.register_descriptor(key, artifact_path=artifact_path, basis=basis)
+        except BaseException as original_error:
+            try:
+                current = self._adapter.get_entry(key)
+                if current == expected:
+                    if previous is None:
+                        self._adapter.delete_entry(key)
+                    else:
+                        self._adapter.put_entry(key, previous)
+            except BaseException as rollback_error:
+                rollback_error.__cause__ = original_error
+                raise RuntimeError("artifact basis registration failed and rollback was incomplete") from rollback_error
+            raise
+
+    def register_entry_transactionally(
+        self,
+        key: ArtifactKey,
+        entry: ArtifactManifestEntry,
+    ) -> bool:
+        """Register an already resolved target entry with exact rollback.
+
+        Target-state resolvers sometimes possess only a frozen digest (for
+        example a selected paid-media version), not the complete basis payload.
+        This seam preserves the same artifact-presence and rollback guarantees
+        without inventing a synthetic basis kind merely to carry that digest.
+        """
+
+        _encode_target_entries({key: entry})
+        observation = self._adapter.inspect_artifact(entry.artifact_path)
+        if observation.blocker is not None:
+            raise ArtifactRegistrationError(observation.blocker.detail)
+        if not observation.present:
+            raise ArtifactRegistrationError(f"artifact is not present: {observation.artifact_path}")
+        expected = ArtifactManifestEntry(
+            artifact_path=observation.artifact_path,
+            basis_digest=entry.basis_digest,
+        )
+        previous = self._adapter.get_entry(key)
+        try:
+            return self._adapter.put_entry(key, expected)
+        except BaseException as original_error:
+            try:
+                current = self._adapter.get_entry(key)
+                if current == expected:
+                    if previous is None:
+                        self._adapter.delete_entry(key)
+                    else:
+                        self._adapter.put_entry(key, previous)
+            except BaseException as rollback_error:
+                rollback_error.__cause__ = original_error
+                raise RuntimeError("artifact entry registration failed and rollback was incomplete") from rollback_error
+            raise
+
+    def forget_entry_transactionally(self, key: ArtifactKey) -> bool:
+        """Remove one current claim with exact rollback on storage failure."""
+
+        previous = self._adapter.get_entry(key)
+        if previous is None:
+            return False
+        try:
+            return self._adapter.delete_entry(key)
+        except BaseException as original_error:
+            try:
+                if self._adapter.get_entry(key) is None:
+                    self._adapter.put_entry(key, previous)
+            except BaseException as rollback_error:
+                rollback_error.__cause__ = original_error
+                raise RuntimeError("artifact entry removal failed and rollback was incomplete") from rollback_error
+            raise
+
+    def forget_entries_transactionally(self, keys: Sequence[ArtifactKey]) -> bool:
+        """Remove a set of claims through one scoped compare-and-swap commit."""
+
+        unique = tuple(dict.fromkeys(keys))
+        before = {key: entry for key in unique if (entry := self._adapter.get_entry(key)) is not None}
+        if not before:
+            return False
+        receipt = ArtifactEntryRekeyPlan(
+            adapter=self._adapter,
+            before=before,
+            after={key: None for key in before},
+            changed=True,
+        ).commit()
+        return receipt.changed
+
+    def plan_entry_rekey(
+        self,
+        source_key: ArtifactKey,
+        target_key: ArtifactKey,
+        *,
+        artifact_path_rewrites: Mapping[str, str] | None = None,
+    ) -> ArtifactEntryRekeyPlan:
+        """Preflight an identity rename without reconstructing its frozen basis.
+
+        The source claim's digest is immutable evidence.  Only the key and a
+        caller-proven formal path move are changed.  A target claim is a hard
+        collision: silently replacing it could attach another artifact's basis
+        to the renamed identity.
+        """
+
+        rewrites = {
+            normalize_artifact_path(source): normalize_artifact_path(target)
+            for source, target in (artifact_path_rewrites or {}).items()
+        }
+        source_entry = self._adapter.get_entry(source_key)
+        if source_key == target_key:
+            if source_entry is None:
+                return ArtifactEntryRekeyPlan(self._adapter, {}, {}, False)
+            replacement = ArtifactManifestEntry(
+                artifact_path=rewrites.get(source_entry.artifact_path, source_entry.artifact_path),
+                basis_digest=source_entry.basis_digest,
+            )
+            if replacement == source_entry:
+                return ArtifactEntryRekeyPlan(self._adapter, {}, {}, False)
+            return ArtifactEntryRekeyPlan(
+                self._adapter,
+                {source_key: source_entry},
+                {source_key: replacement},
+                True,
+            )
+
+        target_entry = self._adapter.get_entry(target_key)
+        if target_entry is not None:
+            raise ArtifactManifestError(f"artifact claim already exists for target key: {target_key.encode()}")
+        if source_entry is None:
+            return ArtifactEntryRekeyPlan(self._adapter, {}, {}, False)
+        replacement = ArtifactManifestEntry(
+            artifact_path=rewrites.get(source_entry.artifact_path, source_entry.artifact_path),
+            basis_digest=source_entry.basis_digest,
+        )
+        return ArtifactEntryRekeyPlan(
+            self._adapter,
+            {source_key: source_entry, target_key: None},
+            {source_key: None, target_key: replacement},
+            True,
+        )
+
     def compare(self, key: ArtifactKey, *, artifact_path: str, basis: ArtifactBasis) -> ArtifactComparison:
+        if not isinstance(basis, ArtifactBasis):
+            raise TypeError("basis must be an ArtifactBasis")
+        return self.compare_entry(
+            key,
+            artifact_path=artifact_path,
+            expected=ArtifactManifestEntry(
+                artifact_path=artifact_path,
+                basis_digest=basis.digest,
+            ),
+        )
+
+    def compare_entry(
+        self,
+        key: ArtifactKey,
+        *,
+        artifact_path: str,
+        expected: ArtifactManifestEntry | None,
+    ) -> ArtifactComparison:
+        """Compare against a canonical target that may carry only a frozen digest."""
+
         observation = self._adapter.inspect_artifact(artifact_path)
         if observation.blocker is not None:
             return ArtifactComparison(
@@ -162,11 +470,20 @@ class ArtifactManifest:
             )
         if entry is None:
             return ArtifactComparison(status=ArtifactStatus.MISSING, artifact_path=observation.artifact_path)
-        status = (
-            ArtifactStatus.CURRENT
-            if entry.artifact_path == observation.artifact_path and entry.basis_digest == basis.digest
-            else ArtifactStatus.STALE
+        # A claim is evidence for one exact formal path.  Reusing that claim for
+        # a different pointer would turn an unregistered file into a stale-but-
+        # usable artifact.  Digest drift is stale; path drift has no claim.
+        if entry.artifact_path != observation.artifact_path:
+            return ArtifactComparison(status=ArtifactStatus.MISSING, artifact_path=observation.artifact_path)
+        normalized_expected = (
+            None
+            if expected is None
+            else ArtifactManifestEntry(
+                artifact_path=normalize_artifact_path(expected.artifact_path),
+                basis_digest=expected.basis_digest,
+            )
         )
+        status = ArtifactStatus.CURRENT if entry == normalized_expected else ArtifactStatus.STALE
         return ArtifactComparison(status=status, artifact_path=observation.artifact_path)
 
 
@@ -176,12 +493,12 @@ class InMemoryArtifactManifestAdapter:
     def __init__(self, *, artifacts: set[str] | None = None) -> None:
         self._lock = threading.RLock()
         self._entries: dict[str, ArtifactManifestEntry] = {}
-        self._artifacts = {_normalize_relative_path(path) for path in artifacts or set()}
+        self._artifacts = {normalize_artifact_path(path) for path in artifacts or set()}
         self._blockers: dict[str, ArtifactBlocker] = {}
 
     def inspect_artifact(self, artifact_path: str) -> ArtifactObservation:
         try:
-            normalized = _normalize_relative_path(artifact_path)
+            normalized = normalize_artifact_path(artifact_path)
         except ValueError as exc:
             blocker = ArtifactBlocker(code="artifact_path_invalid", path=str(artifact_path), detail=str(exc))
             return ArtifactObservation(artifact_path=str(artifact_path), present=False, blocker=blocker)
@@ -197,26 +514,82 @@ class InMemoryArtifactManifestAdapter:
         with self._lock:
             return self._entries.get(key.encode())
 
+    def snapshot_entries(self) -> Mapping[ArtifactKey, ArtifactManifestEntry]:
+        with self._lock:
+            return {ArtifactKey.decode(encoded): entry for encoded, entry in self._entries.items()}
+
     def put_entry(self, key: ArtifactKey, entry: ArtifactManifestEntry) -> bool:
         with self._lock:
             encoded = key.encode()
             if self._entries.get(encoded) == entry:
                 return False
-            self._entries[encoded] = entry
+            updated = {**self._entries, encoded: entry}
+            _assert_unique_artifact_paths(updated)
+            self._entries = updated
             return True
 
     def delete_entry(self, key: ArtifactKey) -> bool:
         with self._lock:
             return self._entries.pop(key.encode(), None) is not None
 
+    def replace_entries_if_matches_atomically(
+        self,
+        *,
+        expected: Mapping[ArtifactKey, ArtifactManifestEntry | None],
+        replacements: Mapping[ArtifactKey, ArtifactManifestEntry | None],
+    ) -> bool:
+        encoded_expected = _encode_optional_entries(expected)
+        encoded_replacements = _encode_optional_entries(replacements)
+        with self._lock:
+            if any(self._entries.get(key) != entry for key, entry in encoded_expected.items()):
+                return False
+            updated = dict(self._entries)
+            for key, entry in encoded_replacements.items():
+                if entry is None:
+                    updated.pop(key, None)
+                else:
+                    updated[key] = entry
+            if updated == self._entries:
+                return False
+            _assert_unique_artifact_paths(updated)
+            self._entries = updated
+            return True
+
+    def replace_snapshot_if_matches_atomically(
+        self,
+        *,
+        expected: Mapping[ArtifactKey, ArtifactManifestEntry],
+        replacement: Mapping[ArtifactKey, ArtifactManifestEntry],
+    ) -> bool:
+        encoded_expected = _encode_target_entries(expected)
+        encoded_replacement = _encode_target_entries(replacement)
+        _assert_unique_artifact_paths(encoded_replacement)
+        with self._lock:
+            if self._entries != encoded_expected:
+                return False
+            self._entries = encoded_replacement
+            return True
+
+    def replace_entries_atomically(
+        self,
+        entries: Mapping[ArtifactKey, ArtifactManifestEntry],
+    ) -> bool:
+        encoded = _encode_target_entries(entries)
+        _assert_unique_artifact_paths(encoded)
+        with self._lock:
+            if self._entries == encoded:
+                return False
+            self._entries = encoded
+            return True
+
     def remove_artifact(self, artifact_path: str) -> None:
-        normalized = _normalize_relative_path(artifact_path)
+        normalized = normalize_artifact_path(artifact_path)
         with self._lock:
             self._artifacts.discard(normalized)
             self._blockers.pop(normalized, None)
 
     def block_artifact(self, artifact_path: str, *, code: str, detail: str) -> None:
-        normalized = _normalize_relative_path(artifact_path)
+        normalized = normalize_artifact_path(artifact_path)
         with self._lock:
             self._artifacts.discard(normalized)
             self._blockers[normalized] = ArtifactBlocker(code=code, path=normalized, detail=detail)
@@ -268,16 +641,87 @@ class ProjectArtifactManifestAdapter:
         self._project_identity = initial_identity
 
     def inspect_artifact(self, artifact_path: str) -> ArtifactObservation:
+        return self._inspect_artifact(artifact_path, include_content_digest=False)
+
+    def inspect_artifact_content(self, artifact_path: str) -> ArtifactObservation:
+        """Inspect and hash one artifact through the same confined file handle."""
+
+        return self._inspect_artifact(artifact_path, include_content_digest=True)
+
+    def inspect_artifact_snapshot(self, artifact_path: str) -> ArtifactObservation:
+        """Read and hash one artifact from the same confined file descriptor."""
+
+        return self._inspect_artifact(
+            artifact_path,
+            include_content_digest=True,
+            include_content_bytes=True,
+        )
+
+    def _inspect_artifact(
+        self,
+        artifact_path: str,
+        *,
+        include_content_digest: bool,
+        include_content_bytes: bool = False,
+    ) -> ArtifactObservation:
         try:
-            normalized = _normalize_relative_path(artifact_path)
+            normalized = normalize_artifact_path(artifact_path)
         except ValueError as exc:
             blocker = ArtifactBlocker(code="artifact_path_invalid", path=str(artifact_path), detail=str(exc))
             return ArtifactObservation(artifact_path=str(artifact_path), present=False, blocker=blocker)
         if os.name == "posix":
-            return self._inspect_artifact_posix(normalized)
-        return self._inspect_artifact_portable(normalized)
+            return self._inspect_artifact_posix(
+                normalized,
+                include_content_digest=include_content_digest,
+                include_content_bytes=include_content_bytes,
+            )
+        return self._inspect_artifact_portable(
+            normalized,
+            include_content_digest=include_content_digest,
+            include_content_bytes=include_content_bytes,
+        )
 
-    def _inspect_artifact_posix(self, normalized: str) -> ArtifactObservation:
+    def _read_open_artifact(
+        self,
+        normalized: str,
+        fd: int,
+        opened_stat: os.stat_result,
+        *,
+        include_content_digest: bool,
+        include_content_bytes: bool,
+    ) -> tuple[str | None, bytes | None, ArtifactObservation | None]:
+        if not include_content_digest:
+            os.read(fd, 1)
+            return None, None, None
+
+        digest = hashlib.sha256()
+        chunks: list[bytes] | None = [] if include_content_bytes else None
+        for chunk in iter(lambda: os.read(fd, 1024 * 1024), b""):
+            digest.update(chunk)
+            if chunks is not None:
+                chunks.append(chunk)
+        completed_stat = os.fstat(fd)
+        opened_version = (opened_stat.st_size, opened_stat.st_mtime_ns, opened_stat.st_ctime_ns)
+        completed_version = (completed_stat.st_size, completed_stat.st_mtime_ns, completed_stat.st_ctime_ns)
+        if completed_version != opened_version:
+            return (
+                None,
+                None,
+                self._artifact_blocked(
+                    normalized,
+                    "artifact_unreadable",
+                    f"artifact changed while its content digest was being read: {normalized}",
+                ),
+            )
+        return digest.hexdigest(), b"".join(chunks) if chunks is not None else None, None
+
+    def _inspect_artifact_posix(
+        self,
+        normalized: str,
+        *,
+        include_content_digest: bool = False,
+        include_content_bytes: bool = False,
+    ) -> ArtifactObservation:
         parts = PurePosixPath(normalized).parts
         directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _O_NOFOLLOW
         file_flags = os.O_RDONLY | _O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
@@ -396,28 +840,47 @@ class ProjectArtifactManifestAdapter:
                         "artifact_not_regular_file",
                         f"artifact path is not a regular file: {normalized}",
                     )
-                os.read(fd, 1)
-                if expected_file_identity is not None:
-                    current_file_stat = final_path.stat(follow_symlinks=False)
-                    if (
-                        _is_linkish(final_path)
-                        or (opened_file_stat.st_dev, opened_file_stat.st_ino) != expected_file_identity
-                        or (current_file_stat.st_dev, current_file_stat.st_ino) != expected_file_identity
-                    ):
-                        return self._artifact_blocked(
-                            normalized,
-                            "artifact_symlink",
-                            f"artifact changed while it was being opened: {normalized}",
-                        )
+                content_digest, content_bytes, content_blocker = self._read_open_artifact(
+                    normalized,
+                    fd,
+                    opened_file_stat,
+                    include_content_digest=include_content_digest,
+                    include_content_bytes=include_content_bytes,
+                )
+                if content_blocker is not None:
+                    return content_blocker
+                current_file_stat = os.stat(parts[-1], dir_fd=directory_fd, follow_symlinks=False)
+                opened_identity = (opened_file_stat.st_dev, opened_file_stat.st_ino)
+                if (
+                    stat.S_ISLNK(current_file_stat.st_mode)
+                    or (current_file_stat.st_dev, current_file_stat.st_ino) != opened_identity
+                    or (expected_file_identity is not None and opened_identity != expected_file_identity)
+                ):
+                    return self._artifact_blocked(
+                        normalized,
+                        "artifact_symlink",
+                        f"artifact changed while it was being opened: {normalized}",
+                    )
             except OSError as exc:
                 return self._artifact_blocked(
                     normalized,
                     "artifact_unreadable",
                     f"artifact is unreadable: {normalized}: {exc}",
                 )
-        return ArtifactObservation(artifact_path=normalized, present=True)
+        return ArtifactObservation(
+            artifact_path=normalized,
+            present=True,
+            content_digest=content_digest,
+            content_bytes=content_bytes,
+        )
 
-    def _inspect_artifact_portable(self, normalized: str) -> ArtifactObservation:
+    def _inspect_artifact_portable(
+        self,
+        normalized: str,
+        *,
+        include_content_digest: bool = False,
+        include_content_bytes: bool = False,
+    ) -> ArtifactObservation:
         if _is_linkish(self._project_dir):
             return self._artifact_blocked(
                 normalized,
@@ -426,11 +889,21 @@ class ProjectArtifactManifestAdapter:
             )
         try:
             with self._guard_portable_project_root():
-                return self._inspect_artifact_portable_guarded(normalized)
+                return self._inspect_artifact_portable_guarded(
+                    normalized,
+                    include_content_digest=include_content_digest,
+                    include_content_bytes=include_content_bytes,
+                )
         except ArtifactManifestError as exc:
             return self._artifact_blocked(normalized, "artifact_unreadable", str(exc))
 
-    def _inspect_artifact_portable_guarded(self, normalized: str) -> ArtifactObservation:
+    def _inspect_artifact_portable_guarded(
+        self,
+        normalized: str,
+        *,
+        include_content_digest: bool = False,
+        include_content_bytes: bool = False,
+    ) -> ArtifactObservation:
         path = self._project_dir.joinpath(*PurePosixPath(normalized).parts)
         cursor = self._project_dir
         checked_components: list[tuple[Path, tuple[int, int], int]] = []
@@ -472,7 +945,15 @@ class ProjectArtifactManifestAdapter:
                         "artifact_not_regular_file",
                         f"artifact path is not a regular file: {normalized}",
                     )
-                os.read(fd, 1)
+                content_digest, content_bytes, content_blocker = self._read_open_artifact(
+                    normalized,
+                    fd,
+                    opened_stat,
+                    include_content_digest=include_content_digest,
+                    include_content_bytes=include_content_bytes,
+                )
+                if content_blocker is not None:
+                    return content_blocker
                 if (opened_stat.st_dev, opened_stat.st_ino) != checked_components[-1][1]:
                     return self._artifact_blocked(
                         normalized,
@@ -502,7 +983,12 @@ class ProjectArtifactManifestAdapter:
                 detail=f"artifact is unreadable: {normalized}: {exc}",
             )
             return ArtifactObservation(artifact_path=normalized, present=False, blocker=blocker)
-        return ArtifactObservation(artifact_path=normalized, present=True)
+        return ArtifactObservation(
+            artifact_path=normalized,
+            present=True,
+            content_digest=content_digest,
+            content_bytes=content_bytes,
+        )
 
     @staticmethod
     def _artifact_blocked(normalized: str, code: str, detail: str) -> ArtifactObservation:
@@ -513,9 +999,44 @@ class ProjectArtifactManifestAdapter:
         )
 
     def get_entry(self, key: ArtifactKey) -> ArtifactManifestEntry | None:
-        with self._locked() as root_fd:
-            entries, _ = self._load_unlocked(root_fd)
-            return entries.get(key.encode())
+        return self._load_readonly().get(key.encode())
+
+    def snapshot_entries(self) -> Mapping[ArtifactKey, ArtifactManifestEntry]:
+        entries = self._load_readonly()
+        return {ArtifactKey.decode(encoded): entry for encoded, entry in entries.items()}
+
+    def _load_readonly(self) -> dict[str, ArtifactManifestEntry]:
+        """Read one consistent snapshot without creating runtime state.
+
+        Once a writer has created the durable lock file, readers serialize with
+        that lock exactly as before.  A project that has never needed a manifest
+        write has no lock file; in that state two identical guarded reads provide
+        a stable snapshot without turning a status query into a filesystem write.
+        A legitimate writer creates the lock before replacing the manifest, so a
+        lock appearing during either read sends the reader back through the
+        serialized path.
+        """
+
+        lock_path = self._project_dir / LOCK_FILENAME
+        if self._runtime_file_identity(lock_path, "manifest lock") is not None:
+            with self._locked() as root_fd:
+                entries, _ = self._load_unlocked(root_fd)
+                return entries
+
+        with self._guard_portable_project_root():
+            entries, original_bytes = self._load_unlocked(None)
+            if self._runtime_file_identity(lock_path, "manifest lock") is not None:
+                with self._locked() as root_fd:
+                    locked_entries, _ = self._load_unlocked(root_fd)
+                    return locked_entries
+            repeated_entries, repeated_bytes = self._load_unlocked(None)
+            if self._runtime_file_identity(lock_path, "manifest lock") is not None:
+                with self._locked() as root_fd:
+                    locked_entries, _ = self._load_unlocked(root_fd)
+                    return locked_entries
+        if original_bytes != repeated_bytes or entries != repeated_entries:
+            raise ArtifactManifestError("artifact manifest changed during an unlocked read")
+        return entries
 
     def put_entry(self, key: ArtifactKey, entry: ArtifactManifestEntry) -> bool:
         with self._locked() as root_fd:
@@ -527,6 +1048,65 @@ class ProjectArtifactManifestAdapter:
             new_bytes = _serialize_manifest(entries)
             if original_bytes == new_bytes:
                 return False
+            self._atomic_replace(new_bytes, root_fd)
+            return True
+
+    def replace_unreadable_entries_atomically(
+        self,
+        entries: Mapping[ArtifactKey, ArtifactManifestEntry],
+    ) -> bool:
+        """Recover an unreadable Manifest with one guarded whole-state replace.
+
+        This seam is intentionally narrower than normal activation: callers may
+        use it only after an explicit recovery policy decided that no existing
+        claim is provable.  The Manifest lock spans revalidation and replacement;
+        if another writer repaired it first, only the identical target is
+        accepted and any other readable state makes the caller retry.
+        """
+
+        encoded = _encode_target_entries(entries)
+        for entry in encoded.values():
+            observation = self.inspect_artifact(entry.artifact_path)
+            if observation.blocker is not None:
+                raise ArtifactRegistrationError(observation.blocker.detail)
+            if not observation.present:
+                raise ArtifactRegistrationError(f"artifact is not present: {entry.artifact_path}")
+        new_bytes = _serialize_manifest(encoded)
+        with self._locked() as root_fd:
+            try:
+                current, _original_bytes = self._load_unlocked(root_fd)
+            except ArtifactManifestError:
+                self._atomic_replace(new_bytes, root_fd)
+                return True
+            if current == encoded:
+                return False
+            raise ArtifactManifestError("artifact manifest became readable during recovery; retry the operation")
+
+    def repair_path_conflicted_entries_atomically(
+        self,
+        repair: Callable[
+            [Mapping[ArtifactKey, ArtifactManifestEntry]],
+            Mapping[ArtifactKey, ArtifactManifestEntry],
+        ],
+    ) -> bool:
+        """Repair only duplicate path ownership while holding the Manifest lock.
+
+        The recovery view retains every other schema check. General reads stay
+        strict, and the transformed whole snapshot must satisfy normal write
+        invariants before one atomic replacement.
+        """
+
+        with self._locked() as root_fd:
+            current, _original_bytes = self._load_unlocked(root_fd, validate_path_ownership=False)
+            try:
+                _assert_unique_artifact_paths(current)
+            except ArtifactManifestError:
+                pass
+            else:
+                raise ArtifactManifestError("artifact manifest became readable during recovery; retry the operation")
+            decoded = {ArtifactKey.decode(encoded): entry for encoded, entry in current.items()}
+            replacement = _encode_target_entries(repair(decoded))
+            new_bytes = _serialize_manifest(replacement)
             self._atomic_replace(new_bytes, root_fd)
             return True
 
@@ -547,6 +1127,117 @@ class ProjectArtifactManifestAdapter:
                     raise ArtifactManifestError(f"cannot remove empty artifact manifest: {exc}") from exc
                 return True
             new_bytes = _serialize_manifest(entries)
+            if original_bytes == new_bytes:
+                return False
+            self._atomic_replace(new_bytes, root_fd)
+            return True
+
+    def replace_entry_if_matches(
+        self,
+        key: ArtifactKey,
+        *,
+        expected: ArtifactManifestEntry,
+        replacement: ArtifactManifestEntry | None,
+    ) -> bool:
+        """Restore one entry only while the caller's registered claim still wins."""
+
+        return self.replace_entries_if_matches_atomically(
+            expected={key: expected},
+            replacements={key: replacement},
+        )
+
+    def replace_entries_if_matches_atomically(
+        self,
+        *,
+        expected: Mapping[ArtifactKey, ArtifactManifestEntry | None],
+        replacements: Mapping[ArtifactKey, ArtifactManifestEntry | None],
+    ) -> bool:
+        """Compare-and-swap claims while preserving unrelated Manifest entries."""
+
+        encoded_expected = _encode_optional_entries(expected)
+        encoded_replacements = _encode_optional_entries(replacements)
+        with self._locked() as root_fd:
+            entries, original_bytes = self._load_unlocked(root_fd)
+            if any(entries.get(key) != entry for key, entry in encoded_expected.items()):
+                return False
+            for key, entry in encoded_replacements.items():
+                if entry is None:
+                    entries.pop(key, None)
+                else:
+                    entries[key] = entry
+            if not entries:
+                try:
+                    if root_fd is None:
+                        (self._project_dir / MANIFEST_FILENAME).unlink()
+                    else:
+                        os.unlink(MANIFEST_FILENAME, dir_fd=root_fd)
+                except FileNotFoundError:
+                    # Deletion is idempotent; another writer may already have removed the empty sidecar.
+                    pass
+                except OSError as exc:
+                    raise ArtifactManifestError(f"cannot remove empty artifact manifest: {exc}") from exc
+                return original_bytes is not None
+            new_bytes = _serialize_manifest(entries)
+            if original_bytes == new_bytes:
+                return False
+            self._atomic_replace(new_bytes, root_fd)
+            return True
+
+    def replace_snapshot_if_matches_atomically(
+        self,
+        *,
+        expected: Mapping[ArtifactKey, ArtifactManifestEntry],
+        replacement: Mapping[ArtifactKey, ArtifactManifestEntry],
+    ) -> bool:
+        """Compare and replace the complete Manifest state under one lock."""
+
+        encoded_expected = _encode_target_entries(expected)
+        encoded_replacement = _encode_target_entries(replacement)
+        new_bytes = _serialize_manifest(encoded_replacement)
+        with self._locked() as root_fd:
+            current, original_bytes = self._load_unlocked(root_fd)
+            if current != encoded_expected:
+                return False
+            if current == encoded_replacement:
+                return True
+            if not encoded_replacement:
+                try:
+                    if root_fd is None:
+                        (self._project_dir / MANIFEST_FILENAME).unlink()
+                    else:
+                        os.unlink(MANIFEST_FILENAME, dir_fd=root_fd)
+                except FileNotFoundError:
+                    # Deletion is idempotent; another writer may already have removed the empty sidecar.
+                    pass
+                except OSError as exc:
+                    raise ArtifactManifestError(f"cannot remove empty artifact manifest: {exc}") from exc
+                return True
+            if original_bytes == new_bytes:
+                return True
+            self._atomic_replace(new_bytes, root_fd)
+            return True
+
+    def replace_entries_atomically(
+        self,
+        entries: Mapping[ArtifactKey, ArtifactManifestEntry],
+    ) -> bool:
+        """Replace the entire manifest through one lock and one atomic rename.
+
+        Activation plans are complete target states.  Persisting them entry by
+        entry would expose a partly activated project after interruption, so the
+        storage boundary accepts and serializes the full set at once.
+        """
+
+        encoded = _encode_target_entries(entries)
+        for entry in encoded.values():
+            observation = self.inspect_artifact(entry.artifact_path)
+            if observation.blocker is not None:
+                raise ArtifactRegistrationError(observation.blocker.detail)
+            if not observation.present:
+                raise ArtifactRegistrationError(f"artifact is not present: {entry.artifact_path}")
+        new_bytes = _serialize_manifest(encoded)
+        with self._locked() as root_fd:
+            _current, original_bytes = self._load_unlocked(root_fd)
             if original_bytes == new_bytes:
                 return False
             self._atomic_replace(new_bytes, root_fd)
@@ -686,7 +1377,12 @@ class ProjectArtifactManifestAdapter:
         ):
             raise ArtifactManifestError(f"{label} changed while it was being opened: {path}")
 
-    def _load_unlocked(self, root_fd: int | None) -> tuple[dict[str, ArtifactManifestEntry], bytes | None]:
+    def _load_unlocked(
+        self,
+        root_fd: int | None,
+        *,
+        validate_path_ownership: bool = True,
+    ) -> tuple[dict[str, ArtifactManifestEntry], bytes | None]:
         path = self._project_dir / MANIFEST_FILENAME
         checked_manifest_identity: tuple[int, int] | None = None
         if root_fd is None or not _O_NOFOLLOW:
@@ -722,7 +1418,7 @@ class ProjectArtifactManifestAdapter:
                 raw = handle.read()
         except OSError as exc:
             raise ArtifactManifestError(f"cannot read artifact manifest: {path}: {exc}") from exc
-        return _parse_manifest(raw), raw
+        return _parse_manifest(raw, validate_path_ownership=validate_path_ownership), raw
 
     def _atomic_replace(self, content: bytes, root_fd: int | None) -> None:
         if root_fd is None:
@@ -801,6 +1497,122 @@ class ArtifactBasis:
     def normalized_bytes(self) -> bytes:
         return self._normalized
 
+    def to_evidence_dict(self) -> dict[str, object]:
+        """Return the complete canonical basis together with its verified digest."""
+
+        payload = json.loads(self._normalized)
+        if not isinstance(payload, dict):  # pragma: no cover - constructor invariant
+            raise RuntimeError("canonical artifact basis is not an object")
+        return {**payload, "digest": self.digest}
+
+    @classmethod
+    def from_evidence_dict(cls, value: object) -> Self:
+        """Parse complete portable evidence and verify its canonical digest."""
+
+        if not isinstance(value, Mapping) or set(value) != {"kind", "kind_version", "inputs", "digest"}:
+            raise ValueError("artifact basis evidence has an invalid schema")
+        kind = value["kind"]
+        kind_version = value["kind_version"]
+        inputs = value["inputs"]
+        digest = value["digest"]
+        if not isinstance(kind, str) or not isinstance(inputs, Mapping):
+            raise ValueError("artifact basis evidence has invalid canonical inputs")
+        basis = cls(kind, kind_version=cast(int, kind_version), inputs=cast(Mapping[str, object], inputs))
+        if not isinstance(digest, str) or basis.digest != digest:
+            raise ValueError("artifact basis evidence digest does not match its canonical inputs")
+        return basis
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactBasisDescriptor:
+    """Strict, portable identity for a canonical basis used as source evidence."""
+
+    kind: str
+    kind_version: int
+    digest: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, str) or not self.kind:
+            raise ValueError("artifact basis descriptor kind must be a non-empty string")
+        if type(self.kind_version) is not int or self.kind_version < 1:
+            raise ValueError("artifact basis descriptor kind_version must be a positive integer")
+        if not isinstance(self.digest, str) or _DIGEST_RE.fullmatch(self.digest) is None:
+            raise ValueError("artifact basis descriptor digest must be a canonical sha256-v1 digest")
+
+    @classmethod
+    def from_basis(cls, basis: ArtifactBasis) -> Self:
+        if not isinstance(basis, ArtifactBasis):
+            raise TypeError("basis must be an ArtifactBasis")
+        return cls(kind=basis.kind, kind_version=basis.kind_version, digest=basis.digest)
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        if not isinstance(value, Mapping):
+            raise ValueError("artifact basis descriptor must be an object")
+        if set(value) != {"kind", "kind_version", "digest"}:
+            raise ValueError("artifact basis descriptor has an invalid schema")
+        return cls(
+            kind=cast(str, value["kind"]),
+            kind_version=cast(int, value["kind_version"]),
+            digest=cast(str, value["digest"]),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "kind_version": self.kind_version,
+            "digest": self.digest,
+        }
+
+
+def compose_video_artifact_basis(
+    *,
+    visual: ArtifactBasis | ArtifactBasisDescriptor,
+    speech: ArtifactBasis | ArtifactBasisDescriptor | None = None,
+    duration: ArtifactBasis | ArtifactBasisDescriptor | None = None,
+) -> ArtifactBasis:
+    """Compose independently owned video inputs into one manifest basis.
+
+    The resulting basis is registered under the existing episode-video key. A
+    change in any present component consequently produces one stale comparison,
+    rather than parallel visual/speech/duration artifact states.
+    """
+
+    visual_descriptor = _coerce_artifact_basis_descriptor("visual", visual)
+    speech_descriptor = _coerce_optional_artifact_basis_descriptor("speech", speech)
+    duration_descriptor = _coerce_optional_artifact_basis_descriptor("duration", duration)
+    return ArtifactBasis.build(
+        "artifact-components/video",
+        kind_version=1,
+        inputs={
+            "components": {
+                "visual": visual_descriptor.to_dict(),
+                "speech": speech_descriptor.to_dict() if speech_descriptor is not None else None,
+                "duration": duration_descriptor.to_dict() if duration_descriptor is not None else None,
+            }
+        },
+    )
+
+
+def _coerce_artifact_basis_descriptor(
+    field: str,
+    value: ArtifactBasis | ArtifactBasisDescriptor,
+) -> ArtifactBasisDescriptor:
+    if isinstance(value, ArtifactBasis):
+        return ArtifactBasisDescriptor.from_basis(value)
+    if isinstance(value, ArtifactBasisDescriptor):
+        return value
+    raise TypeError(f"{field} must be an ArtifactBasis or ArtifactBasisDescriptor")
+
+
+def _coerce_optional_artifact_basis_descriptor(
+    field: str,
+    value: ArtifactBasis | ArtifactBasisDescriptor | None,
+) -> ArtifactBasisDescriptor | None:
+    if value is None:
+        return None
+    return _coerce_artifact_basis_descriptor(field, value)
+
 
 @dataclass(frozen=True, slots=True)
 class ArtifactKey:
@@ -813,14 +1625,11 @@ class ArtifactKey:
         valid = False
         if self.kind is ArtifactKind.ASSET_SHEET and len(self.components) == 2:
             asset_type, asset_id = self.components
-            if (
-                isinstance(asset_type, str)
-                and asset_type in ASSET_TYPES
-                and isinstance(asset_id, str)
-                and bool(asset_id)
-            ):
-                object.__setattr__(self, "components", (asset_type, normalize_asset_name(asset_id)))
-                valid = True
+            if isinstance(asset_type, str) and asset_type in ASSET_TYPES and isinstance(asset_id, str):
+                canonical_asset_id = asset_name_comparison_key(asset_id)
+                if canonical_asset_id:
+                    object.__setattr__(self, "components", (asset_type, canonical_asset_id))
+                    valid = True
         elif self.kind in {ArtifactKind.EPISODE_STEP1, ArtifactKind.EPISODE_SCRIPT} and len(self.components) == 1:
             episode = self.components[0]
             valid = type(episode) is int and episode > 0
@@ -836,6 +1645,18 @@ class ArtifactKey:
         ):
             episode, resource_id = self.components
             valid = type(episode) is int and episode > 0 and isinstance(resource_id, str) and bool(resource_id)
+        elif (
+            self.kind in {ArtifactKind.EPISODE_SUBTITLE, ArtifactKind.EPISODE_PRESENTATION}
+            and len(self.components) == 3
+        ):
+            episode, resource_id, variant = self.components
+            valid = (
+                type(episode) is int
+                and episode > 0
+                and isinstance(resource_id, str)
+                and bool(resource_id)
+                and variant in {"post_production", "use_tts"}
+            )
         if not valid:
             raise ValueError(f"artifact key components do not match {self.kind!r}: {self.components!r}")
 
@@ -879,6 +1700,55 @@ class ArtifactKey:
             ArtifactKind.EPISODE_AUDIO,
             (_episode_number(episode), _non_empty("resource_id", resource_id)),
         )
+
+    @classmethod
+    def episode_subtitle(cls, episode: int, resource_id: str, variant: str) -> Self:
+        """Identify one rendition variant's mechanical subtitle artifact."""
+
+        return cls(
+            ArtifactKind.EPISODE_SUBTITLE,
+            (
+                _episode_number(episode),
+                _non_empty("resource_id", resource_id),
+                _rendition_variant(variant),
+            ),
+        )
+
+    @classmethod
+    def episode_presentation(cls, episode: int, resource_id: str, variant: str) -> Self:
+        """Identify one independently current final-presentation variant."""
+
+        return cls(
+            ArtifactKind.EPISODE_PRESENTATION,
+            (
+                _episode_number(episode),
+                _non_empty("resource_id", resource_id),
+                _rendition_variant(variant),
+            ),
+        )
+
+    @classmethod
+    def episode_resource_artifacts(cls, episode: int, resource_id: str) -> tuple[Self, ...]:
+        """Enumerate every formal artifact identity owned by one script item."""
+
+        return (
+            cls.episode_storyboard(episode, resource_id),
+            cls.episode_video(episode, resource_id),
+            cls.episode_audio(episode, resource_id),
+            cls.episode_subtitle(episode, resource_id, "post_production"),
+            cls.episode_subtitle(episode, resource_id, "use_tts"),
+            cls.episode_presentation(episode, resource_id, "post_production"),
+            cls.episode_presentation(episode, resource_id, "use_tts"),
+        )
+
+    @property
+    def episode_number(self) -> int | None:
+        """Return the owning episode for any episode-scoped artifact key."""
+
+        if self.kind is ArtifactKind.ASSET_SHEET:
+            return None
+        episode = self.components[0]
+        return episode if type(episode) is int else None
 
     def encode(self) -> str:
         payload = json.dumps(
@@ -930,6 +1800,12 @@ def _non_empty(field: str, value: object) -> str:
     return value
 
 
+def _rendition_variant(value: object) -> str:
+    if value not in {"post_production", "use_tts"}:
+        raise ValueError(f"variant must be 'post_production' or 'use_tts', got {value!r}")
+    return cast(str, value)
+
+
 def _normalize_json(value: object) -> object:
     if value is None or isinstance(value, (str, bool)):
         return value
@@ -951,7 +1827,15 @@ def _normalize_json(value: object) -> object:
     raise ValueError(f"artifact basis contains a non-JSON value: {type(value).__name__}")
 
 
-def _normalize_relative_path(value: object) -> str:
+def normalize_artifact_path(value: object) -> str:
+    """Return the canonical project-relative POSIX form of a recorded artifact path.
+
+    This is the single rule for what a registered artifact path may look like:
+    project-relative, POSIX-separated, free of traversal, drive letters and
+    runtime-owned names. Anything else raises ``ValueError`` — callers that
+    only need a verdict catch it rather than re-deriving the rule.
+    """
+
     if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
         raise ValueError(f"artifact path must be a non-empty project-relative POSIX path: {value!r}")
     try:
@@ -981,7 +1865,52 @@ def _normalize_relative_path(value: object) -> str:
     return normalized
 
 
+def _encode_target_entries(
+    entries: Mapping[ArtifactKey, ArtifactManifestEntry],
+) -> dict[str, ArtifactManifestEntry]:
+    encoded: dict[str, ArtifactManifestEntry] = {}
+    for key, entry in entries.items():
+        if not isinstance(key, ArtifactKey):
+            raise TypeError("manifest target keys must be ArtifactKey values")
+        if not isinstance(entry, ArtifactManifestEntry):
+            raise TypeError("manifest target entries must be ArtifactManifestEntry values")
+        normalized_path = normalize_artifact_path(entry.artifact_path)
+        if normalized_path != entry.artifact_path:
+            raise ValueError("manifest target artifact path must be canonical")
+        if _DIGEST_RE.fullmatch(entry.basis_digest) is None:
+            raise ValueError("manifest target basis digest must be a canonical sha256-v1 digest")
+        encoded_key = key.encode()
+        if encoded_key in encoded:
+            raise ValueError(f"duplicate manifest target key: {encoded_key}")
+        encoded[encoded_key] = entry
+    return encoded
+
+
+def _encode_optional_entries(
+    entries: Mapping[ArtifactKey, ArtifactManifestEntry | None],
+) -> dict[str, ArtifactManifestEntry | None]:
+    present: dict[ArtifactKey, ArtifactManifestEntry] = {}
+    for key, entry in entries.items():
+        if entry is not None:
+            present[key] = entry
+    encoded_present = _encode_target_entries(present)
+    encoded: dict[str, ArtifactManifestEntry | None] = {}
+    for key, entry in entries.items():
+        if not isinstance(key, ArtifactKey):
+            raise TypeError("manifest compare-and-swap keys must be ArtifactKey values")
+        encoded[key.encode()] = encoded_present.get(key.encode()) if entry is not None else None
+    return encoded
+
+
+def _entries_match(
+    adapter: ArtifactManifestAdapter,
+    expected: Mapping[ArtifactKey, ArtifactManifestEntry | None],
+) -> bool:
+    return all(adapter.get_entry(key) == entry for key, entry in expected.items())
+
+
 def _serialize_manifest(entries: Mapping[str, ArtifactManifestEntry]) -> bytes:
+    _assert_unique_artifact_paths(entries)
     payload = {
         "entries": {
             key: {
@@ -996,7 +1925,116 @@ def _serialize_manifest(entries: Mapping[str, ArtifactManifestEntry]) -> bytes:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8") + b"\n"
 
 
-def _parse_manifest(raw: bytes) -> dict[str, ArtifactManifestEntry]:
+def _assert_unique_artifact_paths(entries: Mapping[str, ArtifactManifestEntry]) -> None:
+    """Reject a target state in which two identities own one formal file."""
+
+    owners: dict[str, str] = {}
+    for key, entry in entries.items():
+        filesystem_identity = unicodedata.normalize("NFC", entry.artifact_path).casefold()
+        owner = owners.get(filesystem_identity)
+        if owner is not None and owner != key:
+            raise ArtifactManifestError(
+                f"formal artifact path is claimed by multiple keys: {entry.artifact_path} ({owner}, {key})"
+            )
+        owners[filesystem_identity] = key
+
+
+def encode_artifact_manifest_payload(
+    snapshot: ArtifactManifestArchiveSnapshot,
+) -> dict[str, object]:
+    """Encode complete claims and their formal-byte evidence for an archive."""
+
+    encoded = _encode_target_entries(snapshot.entries)
+    content_digests: dict[str, str] = {}
+    for key, digest in snapshot.content_digests.items():
+        if not isinstance(key, ArtifactKey):
+            raise TypeError("archive artifact content digest keys must be ArtifactKey values")
+        if not isinstance(digest, str) or _CONTENT_DIGEST_RE.fullmatch(digest) is None:
+            raise ValueError("archive artifact content digest must be a lowercase SHA-256 digest")
+        content_digests[key.encode()] = digest
+    if set(content_digests) != set(encoded):
+        raise ValueError("archive artifact content digests must cover the complete Manifest snapshot")
+    return {
+        "entries": {
+            key: {
+                "artifact_path": entry.artifact_path,
+                "basis_digest": entry.basis_digest,
+                "content_digest": content_digests[key],
+            }
+            for key, entry in sorted(encoded.items())
+        },
+        "hash_algorithm": HASH_ALGORITHM,
+        "schema_version": ARCHIVE_MANIFEST_SCHEMA_VERSION,
+    }
+
+
+def decode_artifact_manifest_payload(payload: object) -> ArtifactManifestArchiveSnapshot:
+    """Strictly decode claims and formal-byte evidence from an archive envelope."""
+
+    try:
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    except RecursionError as exc:
+        raise ArtifactManifestError("archive artifact manifest payload exceeds the JSON nesting limit") from exc
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ArtifactManifestError(f"artifact manifest payload is not JSON: {exc}") from exc
+    try:
+        decoded = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ArtifactManifestError(f"archive artifact manifest is not valid UTF-8 JSON: {exc}") from exc
+    except RecursionError as exc:
+        raise ArtifactManifestError("archive artifact manifest exceeds the JSON nesting limit") from exc
+    if not isinstance(decoded, dict) or set(decoded) != {"entries", "hash_algorithm", "schema_version"}:
+        raise ArtifactManifestError("archive artifact manifest has an invalid top-level schema")
+    if type(decoded["schema_version"]) is not int or decoded["schema_version"] != ARCHIVE_MANIFEST_SCHEMA_VERSION:
+        raise ArtifactManifestError(
+            f"unsupported archive artifact manifest schema_version: {decoded['schema_version']!r}"
+        )
+    if decoded["hash_algorithm"] != HASH_ALGORITHM:
+        raise ArtifactManifestError(
+            f"unsupported archive artifact manifest hash_algorithm: {decoded['hash_algorithm']!r}"
+        )
+    raw_entries = decoded["entries"]
+    if not isinstance(raw_entries, dict):
+        raise ArtifactManifestError("archive artifact manifest entries must be an object")
+
+    entries: dict[ArtifactKey, ArtifactManifestEntry] = {}
+    content_digests: dict[ArtifactKey, str] = {}
+    encoded_entries: dict[str, ArtifactManifestEntry] = {}
+    for encoded_key, raw_entry in raw_entries.items():
+        if not isinstance(encoded_key, str):
+            raise ArtifactManifestError("archive artifact manifest entry keys must be strings")
+        try:
+            key = ArtifactKey.decode(encoded_key)
+        except ValueError as exc:
+            raise ArtifactManifestError(f"archive artifact manifest contains an invalid key: {encoded_key!r}") from exc
+        if not isinstance(raw_entry, dict) or set(raw_entry) != {
+            "artifact_path",
+            "basis_digest",
+            "content_digest",
+        }:
+            raise ArtifactManifestError(f"archive artifact manifest entry has an invalid schema: {encoded_key}")
+        artifact_path = raw_entry["artifact_path"]
+        basis_digest = raw_entry["basis_digest"]
+        content_digest = raw_entry["content_digest"]
+        try:
+            normalized_path = normalize_artifact_path(artifact_path)
+        except (TypeError, ValueError) as exc:
+            raise ArtifactManifestError(f"archive artifact manifest entry has an invalid path: {encoded_key}") from exc
+        if normalized_path != artifact_path:
+            raise ArtifactManifestError(f"archive artifact manifest entry path is not canonical: {encoded_key}")
+        if not isinstance(basis_digest, str) or _DIGEST_RE.fullmatch(basis_digest) is None:
+            raise ArtifactManifestError(f"archive artifact manifest entry has an invalid basis digest: {encoded_key}")
+        if not isinstance(content_digest, str) or _CONTENT_DIGEST_RE.fullmatch(content_digest) is None:
+            raise ArtifactManifestError(f"archive artifact manifest entry has an invalid content digest: {encoded_key}")
+        entry = ArtifactManifestEntry(artifact_path=normalized_path, basis_digest=basis_digest)
+        entries[key] = entry
+        content_digests[key] = content_digest
+        encoded_entries[encoded_key] = entry
+    _assert_unique_artifact_paths(encoded_entries)
+    return ArtifactManifestArchiveSnapshot(entries=entries, content_digests=content_digests)
+
+
+def _parse_manifest(raw: bytes, *, validate_path_ownership: bool = True) -> dict[str, ArtifactManifestEntry]:
     try:
         payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys)
     except (UnicodeDecodeError, ValueError) as exc:
@@ -1025,7 +2063,7 @@ def _parse_manifest(raw: bytes) -> dict[str, ArtifactManifestEntry]:
         artifact_path = raw_entry["artifact_path"]
         basis_digest = raw_entry["basis_digest"]
         try:
-            normalized_path = _normalize_relative_path(artifact_path)
+            normalized_path = normalize_artifact_path(artifact_path)
         except (TypeError, ValueError) as exc:
             raise ArtifactManifestError(f"artifact manifest entry has an invalid path: {encoded_key}") from exc
         if normalized_path != artifact_path:
@@ -1036,6 +2074,8 @@ def _parse_manifest(raw: bytes) -> dict[str, ArtifactManifestEntry]:
             artifact_path=normalized_path,
             basis_digest=basis_digest,
         )
+    if validate_path_ownership:
+        _assert_unique_artifact_paths(entries)
     return entries
 
 
