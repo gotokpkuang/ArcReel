@@ -80,3 +80,42 @@ server222 上已有调通的 ComfyUI + MiniMax H3 工作流（机智罗 58/59 �
 ### 部署状态
 
 ✅ 已部署 server222（2026-08-13），容器 healthy。配置方法：设置页 → 新增供应商 ComfyUI → Base URL 填 `http://192.168.3.222:8188`（无 API Key）。
+
+---
+
+## GitHub 仓库管理（2026-08-14）
+
+本地仓库已推送到自己的 GitHub fork，remote 配置：
+
+| remote | 地址 | 用途 |
+|---|---|---|
+| `origin` | `https://github.com/gotokpkuang/ArcReel.git` | 推送目标（自己的 fork） |
+| `upstream` | `https://github.com/ArcReel/ArcReel.git` | 上游同步源（原仓库） |
+
+### 上游更新同步（无冲突时）
+
+```bash
+git fetch upstream
+git merge upstream/main    # 沿用本次 merge 经验：本地改动文件与上游无重叠则零冲突
+git push origin main
+```
+
+若 merge 有冲突，按冲突文件逐个人工解决（我们改动的文件集中在 `lib/video_backends/comfyui*`、`lib/providers.py`、`lib/config/registry.py`、`lib/backend_assembly/specs.py`，上游改动这些文件时才需留意）。
+
+### 向原仓库贡献（如 ComfyUI 适配器）
+
+```bash
+git checkout -b feat/comfyui-provider   # 从本地 main 开分支
+# ... 提交改动 ...
+git push origin feat/comfyui-provider
+# 在 GitHub 上对 gotokpkuang/ArcReel 的该分支向 ArcReel/ArcReel 发起 PR
+```
+
+### 部署 server222（不变）
+
+仍以本地 `main` 为基础：`git -c core.autocrlf=false archive --format=tar.gz -o $env:TEMP\arcreel-src.tar.gz HEAD` → 上传 `/tmp` → 解压覆盖 `/quakerv/arcreel` → 重新 patch `docker-compose.yml` → `docker compose build && docker compose up -d`。
+
+### 安全边界（Public 仓库注意）
+
+- 含 server222 凭据/内网信息的文档（`deploy_server222.md`、`h3_test_report.md`、`server222视频生成指南.md`、`server222部署总结.md`）通过 `.git/info/exclude` **排除**，不入公开仓库。
+- `dev_changelogs.md`、`change_doc/` 内仅私网 IP 与模型信息，可公开；如未来写入真实密钥/密码，先脱敏再提交。
